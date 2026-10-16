@@ -28,6 +28,16 @@ One handover links all covered routes and posts one cash deduction.
 Saved expected/received amounts, difference, note, counter, driver and cutoff
 are immutable. Future cash movements do not change them. Counts remain
 awaiting supervisor; verification and correction commands remain unavailable.
+
+## Requirement release controls
+
+Warehouse releases lock both the requirement and its warehouse stock balance
+before checking remaining demand and available quantity. The same lock order
+serializes releases across requests sharing a product and races with HQ
+cancellation, so overfill, overdraw, and cancelled-request releases leave no
+stock movement behind. Transfer, adjustment, correction, reversal, receipt,
+and payment commands are intentionally undefined and rejected without
+creating stock, receipt, or payment records.
 Migration `0006_handover_snapshot_guard` installs the database protection;
 run `python manage.py migrate` when updating an existing installation.
 
@@ -120,6 +130,33 @@ version, state, active franchise, and driver scope. A race produces one
 serialized winner; the losing assignment or start cannot rewrite ownership or
 create a pickup bill.
 
+## Truthful pickup sharing and agreement
+
+`whatsapp-opened` records an attributed sharing attempt with channel metadata;
+it does not mark a bill as sent, delivered, viewed, or agreed. Opening a
+customer bill link likewise leaves lead sharing and agreement fields unchanged.
+
+The `customer_sharing` policy must explicitly select
+`confirmation=collector_assertion` before the assigned collector can use the
+`sent` command. That command records `sent_at` once. The separate `agree`
+command requires `sent_at`, records `agreed_at` once, and advances the lead to
+`agreed`. Replays use the normal idempotency key and version checks; duplicate
+sent/agreement transitions are rejected.
+
+Pickup payment requires the assigned actor, an issued bill, and explicit
+agreement. Failed or out-of-order sharing/agreement attempts create no
+payment, cash movement, closure, or stock movement. The service locks the lead
+while applying each transition and refreshes the caller's model version for
+safe sent-then-agree service chains.
+
+## Pickup settlement
+
+An agreed pickup can be settled in full through Cash or UPI. Cash settlement
+posts a linked negative driver cash movement and rejects insufficient balance;
+UPI requires an external reference and has no cash-ledger effect. Payment,
+bill completion, lead closure, and the cash movement run in one transaction,
+so concurrent retries produce at most one settlement and never post stock.
+
 ## Pickup start, resume, and billing lock
 
 An assigned active Delivery Staff member or Collector starts a lead through
@@ -139,3 +176,12 @@ The lead version and bill version are required for mutations. Start and issue
 are serialized with the lead/bill locks, so retries and concurrent starts
 produce one draft and one invoice. Customer sharing/agreement and payment stay
 separate later steps; starting or saving weights never posts payment or stock.
+
+## Lead history and pickup analytics
+
+Failed pickup commands preserve the reason in the immutable lead audit history;
+the lead register exposes that history and the current load's route and
+warehouse context within the caller's normal scope. Register summaries include
+state counts and billed, paid, and outstanding pickup totals. The dashboard
+also returns daily pickup counts and the same settled totals for charting;
+failed leads remain failed until an explicit scheduling workflow changes them.

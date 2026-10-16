@@ -96,10 +96,14 @@ def issue(actor,bill,data):
     bill.save();event(actor,'pickups' if bill.lead_id else 'bills',bill,{'number':bill.number},'bill.issued')
     return bill
 
+@transaction.atomic
 def pay(actor,bill,data):
     # Payment settlement is serialized on the bill row so two operators cannot
     # both observe the same outstanding balance and overpay it.
-    bill=Bill.objects.select_for_update(of=('self',)).select_related('franchise','customer').get(pk=bill.pk)
+    locked_bill=Bill.objects.select_for_update(of=('self',)).select_related('franchise','customer').get(pk=bill.pk)
+    # Keep a caller-held instance current for service users that chain commands
+    # in one transaction (the API serializes the returned locked instance).
+    bill.__dict__.update(locked_bill.__dict__)
     version(bill,data.get('version'))
     if bill.state not in ('issued','cancellation_requested'): raise Conflict('This bill is not payable.')
     if bill.franchise.status!='active': policy('suspended_settlement')

@@ -85,6 +85,11 @@ class RegisterView(APIView):
         try: page=max(1,int(request.query_params.get('page',1)))
         except ValueError: raise ValidationError('Invalid page.')
         summary={}
+        if feature=='leads':
+            summary.update({state:qs.filter(state=state).count() for state in ('unassigned','scheduled','weighing','sent','agreed','closed','not_completed','cancelled')})
+            paid=Bill.objects.filter(lead__in=qs).exclude(state='draft').aggregate(total=Sum('total'),settled=Sum('settled'))
+            summary.update({'billed':str(paid['total'] or 0),'paid':str(paid['settled'] or 0),
+                            'outstanding':str((paid['total'] or 0)-(paid['settled'] or 0))})
         if feature=='handovers':
             totals=qs.aggregate(expected=Sum('expected'),received=Sum('received'),difference=Sum('difference'))
             summary={key:str(value or 0) for key,value in totals.items()}
@@ -263,6 +268,7 @@ class DashboardView(APIView):
         if user.role in GRANTS['leads']:
             qs=scope(user,Lead.objects.all(),'leads');result['metrics'] += [{'label':'Open leads','value':qs.exclude(state__in=['closed','not_completed','cancelled']).count(),'unit':'leads','href':'leads'},{'label':'Closed pickups','value':qs.filter(state='closed').count(),'unit':'pickups','href':'leads'},{'label':'Not completed','value':qs.filter(state='not_completed').count(),'unit':'leads','href':'leads'}]
             result['leads']=serialize('leads',qs.select_related('customer','franchise','driver','load')[:8],True)
+            result['pickup_chart']=pickup_chart(qs)
         if user.role in BILLING:
             qs=scope(user,Bill.objects.all(),'bills');active=qs.exclude(state__in=['draft','cancelled'])
             for title,kinds in [('Pay suppliers',['collection','b2b']),('Receive from customers',['sale'])]:
@@ -271,6 +277,18 @@ class DashboardView(APIView):
             result['metrics'].append({'label':'Drafts in progress','value':qs.filter(state='draft').count(),'unit':'drafts','href':'bills'})
             result['bills']=serialize('bills',qs[:8],True)
         return Response(result)
+
+def pickup_chart(qs):
+    """Return scope-preserving daily pickup counts and settled totals."""
+    rows={}
+    for lead in qs.only('pickup_date','state').order_by('pickup_date','pk'):
+        key=lead.pickup_date.isoformat()
+        row=rows.setdefault(key,{'date':key,'scheduled':0,'closed':0,'not_completed':0,'paid':'0'})
+        if lead.state in ('scheduled','weighing','sent','agreed'): row['scheduled']+=1
+        elif lead.state in ('closed','not_completed'): row[lead.state]+=1
+    totals=Bill.objects.filter(lead__in=qs).exclude(state='draft').aggregate(paid=Sum('settled'),billed=Sum('total'))
+    return {'daily':list(rows.values()),'totals':{'billed':str(totals['billed'] or 0),'paid':str(totals['paid'] or 0),
+            'outstanding':str((totals['billed'] or 0)-(totals['paid'] or 0))}}
 
 class OptionsView(APIView):
     @extend_schema(responses=dict)
@@ -345,6 +363,7 @@ class TeamView(APIView):
             target.warehouse=Warehouse.objects.get(pk=data['warehouse']) if data.get('warehouse') else target.warehouse
             if role!=Role.WAREHOUSE: target.warehouse=None
             if data.get('action')=='disable': target.is_active=False
+            elif data.get('action')=='enable': target.is_active=True
             target.permission_version+=1;target.full_clean();target.save()
             AuditEvent.objects.create(actor=actor,franchise=book,action='team.updated',resource=str(target.pk),details={'role':role,'active':target.is_active})
             Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=target.id,resource_id='')

@@ -42,6 +42,14 @@ def serialize(feature,obj,many=False):
     if isinstance(obj,Lead):
         data['phone']=obj.customer.phone;data['address']=obj.customer.address;data['area']=obj.customer.area
         data['bill_id']=str(obj.bill.id) if hasattr(obj,'bill') else None
+        load=getattr(obj,'load',None)
+        data['current_load']={'id':str(load.pk),'state':load.state,'warehouse':str(load.warehouse_id),
+                              'returned_at':load.returned_at.isoformat() if load.returned_at else None,
+                              'unloaded_at':load.unloaded_at.isoformat() if load.unloaded_at else None} if load else None
+        data['failure_history']=[{'id':str(entry.pk),'at':entry.created_at.isoformat(),
+                                  'actor':str(entry.actor_id),'reason':entry.details.get('reason','')}
+                                 for entry in AuditEvent.objects.filter(resource=str(obj.pk),
+                                     franchise_id=obj.franchise_id,action='pickup.failed').order_by('-created_at','-pk')]
     if isinstance(obj,Bill):
         from .services.billing import cancellation_history
         data['outstanding']=str(obj.total-obj.settled)

@@ -33,7 +33,12 @@ def start(actor,lead,data):
     bill,_=Bill.objects.get_or_create(lead=lead,defaults={'franchise':lead.franchise,'creator':actor,'customer':lead.customer,'kind':'collection'})
     event(actor,'leads',lead,action='pickup.started');return bill
 
+@transaction.atomic
 def advance(actor,lead,action,data):
+    locked=Lead.objects.select_for_update().select_related('franchise').get(pk=lead.pk)
+    # Preserve the caller's model instance semantics for service callers that
+    # chain sent -> agreement using the returned version.
+    lead.__dict__.update(locked.__dict__)
     require(actor,'pickup.write');book_allowed(actor,lead.franchise)
     if lead.driver_id!=actor.id: raise PermissionDenied()
     version(lead,data.get('version'))
@@ -45,7 +50,7 @@ def advance(actor,lead,action,data):
     else:
         if not hasattr(lead,'bill') or lead.bill.state!='issued': raise Conflict('Lock the purchase bill first.')
         if action=='whatsapp-opened':
-            event(actor,'leads',lead,action='share.whatsapp_opened');return lead
+            event(actor,'leads',lead,{'channel':'whatsapp','attempted_at':timezone.now().isoformat()},'share.whatsapp_opened');return lead
         if action=='sent':
             if policy('customer_sharing').get('confirmation')!='collector_assertion': raise PolicyUnavailable('Sent confirmation policy is not supported.')
             if lead.sent_at: raise Conflict('Sharing was already confirmed.')
@@ -55,4 +60,7 @@ def advance(actor,lead,action,data):
             if lead.agreed_at: raise Conflict('Agreement was already recorded.')
             lead.agreed_at=timezone.now();lead.state='agreed'
         else: raise ValidationError('Unknown pickup action.')
-    lead.version+=1;lead.save();event(actor,'leads',lead,action='pickup.'+action);return lead
+    lead.version+=1;lead.save()
+    details={'reason':lead.failure_reason} if action=='failed' else None
+    event(actor,'leads',lead,details, 'pickup.'+action)
+    return lead
