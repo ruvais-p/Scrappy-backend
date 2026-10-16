@@ -7,7 +7,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import transaction,close_old_connections
 from django.utils import timezone
 from django.core.exceptions import ValidationError
-from core.models import Role,Lead,ImportBatch
+from core.models import Role,Lead,ImportBatch,Policy
 from core.fixtures import synthetic_records
 from core.services import imports
 from core.services.common import Conflict
@@ -28,6 +28,29 @@ def test_import_zero_coordinates_and_retry(data):
     assert Lead.objects.count()==count
     lead=Lead.objects.get(pk=batch.rows[0]['lead'])
     assert lead.latitude==0 and lead.longitude==0 and lead.pickup_time.hour==9
+    assert batch.rows[0]['status']=='created'
+    assert 'waiting' not in batch.rows[0]['message']
+
+@pytest.mark.django_db
+def test_import_commit_requires_supported_policy_and_has_no_side_effect(data):
+    actor=data['users'][Role.HQ];batch=imports.preview(actor,upload(data));before=Lead.objects.count()
+    Policy.objects.filter(key='lead_import').delete()
+    with pytest.raises(Exception): imports.commit(actor,batch)
+    assert Lead.objects.count()==before and not ImportBatch.objects.get(pk=batch.pk).committed
+
+@pytest.mark.django_db
+def test_import_changed_driver_rolls_back_all_rows(data):
+    actor=data['users'][Role.HQ];batch=imports.preview(actor,upload(data))
+    driver=data['users'][Role.COLLECTOR];driver.is_active=False;driver.save()
+    with pytest.raises(Exception): imports.commit(actor,batch)
+    assert Lead.objects.count()==len(data['leads'])
+    batch.refresh_from_db();assert not batch.committed and batch.rows[0].get('lead') is None
+
+@pytest.mark.django_db
+def test_import_batch_scope_is_creator_bound(data,client_for):
+    actor=data['users'][Role.HQ];batch=imports.preview(actor,upload(data))
+    other=data['users'][Role.APP]
+    assert client_for(other).get(f'/api/v1/imports/{batch.pk}/').status_code==403
 
 @pytest.mark.django_db
 def test_corrupt_workbook_returns_validation(data):

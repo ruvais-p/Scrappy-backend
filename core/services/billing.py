@@ -12,6 +12,26 @@ def resolved_rate(product,book,kind):
     if not r: raise ValidationError(f'No applicable {kind} rate for {product.name}.')
     return r.amount
 
+def cancellation_history(bill):
+    return AuditEvent.objects.filter(resource=str(bill.pk),franchise_id=bill.franchise_id,
+                                     action='bill.cancellation_requested').order_by('created_at','pk')
+
+def request_cancellation(actor,bill,data):
+    require(actor,'bill.write')
+    bill=scoped_get(actor,Bill.objects.select_for_update(),'bills',bill.pk)
+    version(bill,data.get('version'))
+    if bill.lead_id:
+        raise PolicyUnavailable('Pickup bill correction policy is not defined.')
+    if bill.state not in ('issued','completed') or cancellation_history(bill).exists():
+        raise Conflict('This bill cannot enter cancellation review.')
+    reason=data.get('reason')
+    if not isinstance(reason,str) or not reason.strip() or len(reason.strip())>500:
+        raise ValidationError('Enter a cancellation reason of 1 to 500 characters.')
+    previous_state=bill.state
+    bill.state='cancellation_requested';bill.version+=1;bill.save()
+    event(actor,'bills',bill,{'reason':reason.strip(),'previous_state':previous_state},'bill.cancellation_requested')
+    return bill
+
 def lines_for(actor,book,kind,lines,pickup=False):
     if not isinstance(lines,list) or not 1<=len(lines)<=100: raise ValidationError('Enter between 1 and 100 bill items.')
     output=[];seen=set()
@@ -45,7 +65,7 @@ def save_draft(actor,data,bill=None):
 def issue(actor,bill,data):
     version(bill,data.get('version'))
     if bill.state!='draft': raise Conflict('This bill is already issued.')
-    if bill.kind=='b2b': policy('b2b_payment_authority')
+    if bill.kind=='b2b': raise PolicyUnavailable('B2B posting authority is not defined.')
     config=policy('billing_issue')
     required=('issuer_by_book','tax_mode','rounding','number_prefix')
     if any(k not in config for k in required): raise PolicyUnavailable('Billing policy is incomplete.')
@@ -79,11 +99,11 @@ def issue(actor,bill,data):
 def pay(actor,bill,data):
     # Payment settlement is serialized on the bill row so two operators cannot
     # both observe the same outstanding balance and overpay it.
-    bill=Bill.objects.select_for_update().select_related('franchise','customer').get(pk=bill.pk)
+    bill=Bill.objects.select_for_update(of=('self',)).select_related('franchise','customer').get(pk=bill.pk)
     version(bill,data.get('version'))
     if bill.state not in ('issued','cancellation_requested'): raise Conflict('This bill is not payable.')
     if bill.franchise.status!='active': policy('suspended_settlement')
-    if bill.kind=='b2b': policy('b2b_payment_authority')
+    if bill.kind=='b2b': raise PolicyUnavailable('B2B posting authority is not defined.')
     amount=decimal(data.get('amount'));method=data.get('method');reference=str(data.get('reference','')).strip()
     if method not in ('Cash','UPI','Bank transfer','Card','Cheque'): raise ValidationError('Invalid payment method.')
     if method=='Cheque': policy('cheque_clearance')
@@ -102,7 +122,7 @@ def pay(actor,bill,data):
         move(actor,actor,-amount,'customer_payment',payment=payment)
     bill.settled+=amount;bill.version+=1
     if bill.settled==bill.total:
-        bill.state='completed'
+        bill.state='cancellation_requested' if bill.state=='cancellation_requested' or cancellation_history(bill).exists() else 'completed'
         if lead: lead.state='closed';lead.closed_at=timezone.now();lead.version+=1;lead.save();event(actor,'leads',lead,action='pickup.closed')
     bill.save();event(actor,'pickups' if lead else 'bills',bill,{'payment':str(payment.id),'amount':str(amount),'method':method},'payment.recorded')
     return bill

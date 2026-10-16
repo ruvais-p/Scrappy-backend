@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db.models import Q
 from rest_framework.exceptions import PermissionDenied, NotFound, APIException
-from .models import Role, Policy
+from .models import Role, Policy, HandoverRoute
 NETWORK = {Role.SUPER, Role.ADMIN, Role.HQ}
 OWN = {Role.DRIVER,Role.STAFF,Role.COLLECTOR}
 BILLING = {Role.SUPER,Role.ADMIN,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF}
@@ -21,7 +21,7 @@ GRANTS = {
  'franchise.create':{Role.SUPER,Role.HQ}, 'franchise.edit':{Role.SUPER,Role.HQ},'franchise.suspend':{Role.SUPER},
  'customer.create':BILLING, 'customer.edit':{Role.SUPER,Role.ADMIN,Role.APP,Role.DIGESTER},
  'product.write':{Role.SUPER},'product.assign':{Role.SUPER},'rate.write':{Role.SUPER,Role.HQ},
- 'lead.assign':{Role.HQ,Role.APP},'lead.schedule':{Role.HQ},'pickup.write':{Role.DRIVER,Role.COLLECTOR},
+'lead.assign':{Role.HQ,Role.APP},'lead.schedule':{Role.HQ,Role.APP},'pickup.write':{Role.DRIVER,Role.COLLECTOR},
  'bill.write':BILLING, 'receipt.write':{Role.WAREHOUSE},'requirement.write':{Role.HQ},'release.write':{Role.WAREHOUSE},
  'float.write':{Role.HQ,Role.WAREHOUSE}, 'count.write':{Role.WAREHOUSE},'payout.write':{Role.SUPER,Role.ADMIN},
 }
@@ -50,6 +50,12 @@ def scope(user, qs, feature):
     if model=='Rate': qs=qs.filter(product__franchises=user.franchise)
     if user.role==Role.WAREHOUSE:
         if model in ('StockBalance','StockMovement','Receipt','Load'): qs=qs.filter(warehouse_id=user.warehouse_id)
+        if model=='Handover':
+            local=HandoverRoute.objects.filter(load__warehouse_id=user.warehouse_id).values('handover_id')
+            foreign=HandoverRoute.objects.exclude(load__warehouse_id=user.warehouse_id).values('handover_id')
+            qs=qs.filter(pk__in=local).exclude(pk__in=foreign)
+    if model=='ImportBatch' and user.role not in NETWORK:
+        qs=qs.filter(actor=user)
     if user.role in OWN:
         if model=='Bill': qs=qs.filter(creator=user)
         elif model=='Payment': qs=qs.filter(bill__creator=user)

@@ -1,11 +1,14 @@
 from django.utils import timezone
+from django.db import transaction
 from rest_framework.exceptions import ValidationError,PermissionDenied
 from core.models import *
 from core.policy import *
 from .common import version,event,Conflict
 
+@transaction.atomic
 def assign(actor,lead,data):
     require(actor,'lead.assign');book_allowed(actor,lead.franchise);version(lead,data.get('version'))
+    if lead.franchise.status!='active': raise Conflict('This franchise is not accepting new assignments.')
     if lead.started_at or lead.state not in ('unassigned','scheduled'): raise Conflict('Only unstarted leads can be assigned.')
     driver=User.objects.filter(pk=data.get('driver'),is_active=True,franchise=lead.franchise,role__in=[Role.DRIVER,Role.COLLECTOR]).first()
     if not driver: raise ValidationError('Choose an active driver from this franchise.')
@@ -15,13 +18,18 @@ def assign(actor,lead,data):
     if old and old!=driver.id: Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=old,resource_id='')
     return lead
 
+@transaction.atomic
 def start(actor,lead,data):
     require(actor,'pickup.write');book_allowed(actor,lead.franchise)
     if lead.driver_id!=actor.id: raise PermissionDenied()
     if lead.state not in ('scheduled','weighing'): raise Conflict('This pickup cannot be started or reopened.')
     if lead.franchise.status!='active': raise Conflict('Franchise is inactive.')
+    if lead.state=='weighing' and not lead.started_at:
+        raise Conflict('Pickup state is inconsistent. Refresh the assigned lead.')
     if lead.state=='scheduled':
         version(lead,data.get('version'));lead.state='weighing';lead.started_at=timezone.now();lead.version+=1;lead.save()
+    elif data.get('version') is not None and str(data['version'])!=str(lead.version):
+        raise Conflict('This pickup changed. Refresh before continuing.')
     bill,_=Bill.objects.get_or_create(lead=lead,defaults={'franchise':lead.franchise,'creator':actor,'customer':lead.customer,'kind':'collection'})
     event(actor,'leads',lead,action='pickup.started');return bill
 

@@ -39,6 +39,13 @@ class RegisterView(APIView):
         if feature not in FIELDS: raise NotFound()
         if pk: return Response(serialize(feature,get_object(request.user,feature,pk)))
         qs=feature_scope(request.user,feature)
+        if feature=='loads' and request.query_params.get('settlement_state'):
+            settlement=request.query_params['settlement_state']
+            if settlement in ('awaiting_supervisor','verified','disputed'):
+                qs=qs.filter(counted_in__handover__state=settlement)
+            elif settlement=='on_route': qs=qs.filter(counted_in__isnull=True,state='on_route')
+            elif settlement=='count_pending': qs=qs.filter(counted_in__isnull=True).exclude(state='on_route')
+            else: raise ValidationError('Invalid settlement state.')
         if feature=='bills' and request.query_params.get('issued')=='1': qs=qs.exclude(state='draft')
         fields={f.name for f in qs.model._meta.fields}
         selected_book=request.query_params.get('franchise')
@@ -78,6 +85,15 @@ class RegisterView(APIView):
         try: page=max(1,int(request.query_params.get('page',1)))
         except ValueError: raise ValidationError('Invalid page.')
         summary={}
+        if feature=='handovers':
+            totals=qs.aggregate(expected=Sum('expected'),received=Sum('received'),difference=Sum('difference'))
+            summary={key:str(value or 0) for key,value in totals.items()}
+            summary['basis']='Saved handovers in the full filtered result; each handover counted once'
+            summary['currency']='INR'
+            summary['states']={state:qs.filter(state=state).count() for state in ('awaiting_supervisor','verified','disputed')}
+            qs=qs.select_related('driver','franchise','counter').prefetch_related('routes')
+        if feature=='loads':
+            qs=qs.select_related('counted_in__handover')
         if feature in ('bills','pickups'):
             active=qs.exclude(state__in=['draft','cancelled'])
             for direction,kinds in [('outgoing',['collection','b2b']),('incoming',['sale'])]:
@@ -150,10 +166,7 @@ class CommandView(APIView):
             if feature in ('bills','pickups'):
                 if obj.lead_id and obj.creator_id!=actor.pk: raise PermissionDenied('Pickup writes belong to the assigned collector.')
                 if action=='request-cancellation':
-                    version(obj,data.get('version'))
-                    if obj.state not in ('issued','completed'): raise Conflict('This bill cannot enter cancellation review.')
-                    if not str(data.get('reason','')).strip(): raise ValidationError('A cancellation reason is required.')
-                    obj.state='cancellation_requested';obj.version+=1;obj.save();event(actor,'bills',obj,{'reason':str(data['reason'])[:500]},'bill.cancellation_requested')
+                    obj=billing.request_cancellation(actor,obj,data)
                 else: obj=billing.save_draft(actor,data,obj) if action=='save' else billing.issue(actor,obj,data) if action=='issue' else billing.pay(actor,obj,data)
             elif feature=='leads':
                 if action=='assign': obj=pickups.assign(actor,obj,data)
@@ -163,7 +176,8 @@ class CommandView(APIView):
                 elif action in ('reschedule','cancel'):
                     version(obj,data.get('version'))
                     if obj.started_at or obj.state not in ('scheduled','unassigned'): raise Conflict('Only unstarted leads can be changed.')
-                    if action=='cancel': obj.state='cancelled'
+                    if action=='cancel':
+                        obj.state='cancelled';obj.failure_reason='Cancelled before pickup start.'
                     else:
                         try: obj.pickup_date=datetime.strptime(data['pickup_date'],'%Y-%m-%d').date();obj.pickup_time=datetime.strptime(data['pickup_time'],'%H:%M').time()
                         except (KeyError,ValueError): raise ValidationError('Enter a valid date and time.')
@@ -213,10 +227,22 @@ class CashView(APIView):
         users=User.objects.filter(role__in=[Role.DRIVER,Role.COLLECTOR],is_active=True)
         if request.user.role not in NETWORK: users=users.filter(franchise_id=request.user.franchise_id)
         if request.user.role in OWN: users=users.filter(pk=request.user.pk)
+        if request.user.role==Role.WAREHOUSE: users=users.filter(load__warehouse_id=request.user.warehouse_id).distinct()
         result=[]
         for driver in users:
-            row=DriverAccount.objects.filter(driver=driver).first();loads=Load.objects.filter(driver=driver,counted_in__isnull=True)
-            result.append({'id':driver.id,'name':driver.get_full_name() or driver.email,'franchise':str(driver.franchise_id),'balance':str(row.balance if row else 0),'version':row.version if row else 1,'routes':[str(l.id) for l in loads],'on_route':any(l.state=='on_route' or not l.returned_at for l in loads)})
+            row=DriverAccount.objects.filter(driver=driver).first();loads=list(Load.objects.filter(driver=driver,counted_in__isnull=True))
+            on_route=any(l.state=='on_route' for l in loads)
+            reason=''
+            if request.user.role!=Role.WAREHOUSE: reason='Cash counting is available to the assigned warehouse manager.'
+            elif not loads: reason='No eligible uncounted routes.'
+            elif on_route: reason='Driver still out.'
+            elif any(l.warehouse_id!=request.user.warehouse_id or l.franchise_id!=request.user.franchise_id for l in loads): reason='All covered routes must belong to your assigned warehouse.'
+            elif any(l.state!='returned' or not l.returned_at or l.returned_at>timezone.now() or not l.eligibility_reference.strip() for l in loads): reason='Valid route-return evidence is required before counting.'
+            if not reason:
+                try: policy('route_eligibility')
+                except PolicyUnavailable as exc: reason=str(exc.detail)
+            visible=[l for l in loads if request.user.role!=Role.WAREHOUSE or l.warehouse_id==request.user.warehouse_id]
+            result.append({'id':driver.id,'name':driver.get_full_name() or driver.email,'franchise':str(driver.franchise_id),'balance':str(row.balance if row else 0),'version':row.version if row else 1,'routes':[str(l.id) for l in visible],'on_route':on_route,'count_available':not reason,'count_blocked_reason':reason})
         return Response({'results':result})
     @extend_schema(request=dict,responses=dict)
     def post(self,request):

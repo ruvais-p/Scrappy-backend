@@ -34,7 +34,9 @@ def command(actor,key,action,payload,fn):
     reviewed_permission_version=actor.permission_version
     with transaction.atomic():
         # Actor lock serializes duplicate keys and coordinates revocation.
-        actor=User.objects.select_for_update().get(pk=actor.pk)
+        # Keep permission changes serialized without blocking foreign-key
+        # references to this actor in another driver's cash transaction.
+        actor=User.objects.select_for_update(no_key=True).get(pk=actor.pk)
         if not actor.is_active: raise ValidationError('Account is inactive.')
         if actor.permission_version!=reviewed_permission_version: raise PermissionDenied('Permissions changed. Sign in again before continuing.')
         prior=CommandResult.objects.filter(actor=actor,key=key).first()

@@ -72,6 +72,7 @@ def test_cash_handover_once(data,client_for):
     payload={'action':'count','driver':u.id,'received':'0','note':'No cash returned','routes':[str(load.id)],'version':row.version}
     assert post(c,'driver-cash/',payload).status_code==409
     load.state='returned';load.returned_at=timezone.now();load.eligibility_reference='Synthetic';load.save()
+    payload['version']=DriverAccount.objects.get(driver=u).version
     key=str(uuid.uuid4());r=post(c,'driver-cash/',payload,key);assert r.status_code==200,r.data
     assert post(c,'driver-cash/',payload,key).status_code==200
     h=Handover.objects.get();assert h.received==0 and h.expected==500 and h.state=='awaiting_supervisor'

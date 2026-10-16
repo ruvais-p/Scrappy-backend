@@ -17,7 +17,7 @@ FIELDS={
 'movements':(StockMovement,['id','warehouse','product','actor','quantity','kind','receipt','requirement','created_at']),
 'requirements':(Requirement,['id','franchise','product','actor','quantity','released','due_date','note','state','created_at','version']),
 'cash':(CashMovement,['id','driver','franchise','actor','amount','kind','payment','handover','created_at']),
-'handovers':(Handover,['id','driver','franchise','counter','expected','received','difference','note','state','cutoff','version']),
+'handovers':(Handover,['id','driver','franchise','counter','expected','received','difference','note','state','cutoff','created_at','version']),
 'audit':(AuditEvent,['id','actor','franchise','action','resource','details','created_at']),
 'settings':(CompanySetting,['id','section','values','version']),
 'imports':(ImportBatch,['id','rows','committed','created_at','version']),
@@ -43,15 +43,26 @@ def serialize(feature,obj,many=False):
         data['phone']=obj.customer.phone;data['address']=obj.customer.address;data['area']=obj.customer.area
         data['bill_id']=str(obj.bill.id) if hasattr(obj,'bill') else None
     if isinstance(obj,Bill):
+        from .services.billing import cancellation_history
         data['outstanding']=str(obj.total-obj.settled)
         data['direction']='incoming' if obj.kind=='sale' else 'outgoing'
+        data['cancellation_requests']=[{'id':str(entry.pk),'requested_at':entry.created_at.isoformat(),
+                                       'requested_by':str(entry.actor_id),'reason':entry.details.get('reason',''),
+                                       'status':'pending'} for entry in cancellation_history(obj)]
     if isinstance(obj,Payment):
         data['direction']='incoming' if obj.bill.kind=='sale' else 'outgoing'
         data['bill_number']=obj.bill.number
         data['customer_name']=obj.bill.customer.name
         data['bill_total']=str(obj.bill.total)
         data['bill_outstanding']=str(obj.bill.total-obj.bill.settled)
-    if isinstance(obj,Handover): data['included_routes']=[str(r.load_id) for r in obj.routes.all()]
+    if isinstance(obj,Handover):
+        data['included_routes']=[str(r.load_id) for r in obj.routes.all()]
+        data['decision_actions']=[]
+    if isinstance(obj,Load):
+        membership=getattr(obj,'counted_in',None)
+        data['handover']=str(membership.handover_id) if membership else None
+        data['settlement_state']=membership.handover.state if membership else 'on_route' if obj.state=='on_route' else 'count_pending'
+        data['included_in_handover']=bool(membership)
     if isinstance(obj,Receipt):
         data['lead_version']=obj.lead.version
         data['customer_name']=obj.lead.customer.name
