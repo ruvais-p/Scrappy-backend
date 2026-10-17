@@ -46,10 +46,11 @@ def export_rows(actor,payload):
     else:
         require(actor,feature)
         qs=feature_scope(actor,feature)
-    fields={f.name for f in qs.model._meta.fields}
-    for key,value in payload.get('filters',{}).items():
-        if key not in ('franchise','state','kind','product','warehouse') or key not in fields: raise ValidationError('Unsupported export filter.')
-        if value:qs=qs.filter(**{key:value})
+    from .queries import filter_records
+    filters=payload.get('filters',{})
+    allowed={'search','from','to','issued','franchise','state','kind','product','warehouse','driver','receipt','requirement','flagged','settlement_state','action','actor','franchise_type','staff','customer','direction','financial_only','payment_state','category','status','active','method'}
+    if not isinstance(filters,dict) or set(filters)-allowed: raise ValidationError('Unsupported export filter.')
+    qs,_=filter_records(qs,feature,filters)
     if qs.count()>10000: raise ValidationError('Narrow this export to 10,000 records or fewer.')
     return serialize(feature,qs,True)
 

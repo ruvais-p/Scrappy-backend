@@ -3,7 +3,7 @@ import secrets
 import time
 from datetime import timedelta
 from django.conf import settings
-from django.contrib.auth import authenticate,login,logout
+from django.contrib.auth import authenticate,login,logout,update_session_auth_hash
 from django.contrib.auth.password_validation import validate_password
 from django.core.mail import send_mail
 from django.db import transaction
@@ -17,10 +17,11 @@ from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError,PermissionDenied,Throttled
 from drf_spectacular.utils import extend_schema
 from .models import User,Role,AccessToken,LoginAttempt,AuditEvent
-from .policy import GRANTS
+from .policy import GRANTS,effective_permissions
 
 def identity(user):
-    return {'id':user.id,'name':user.get_full_name() or user.email,'email':user.email,'role':user.role,'role_label':user.get_role_display(),'franchise':str(user.franchise_id) if user.franchise_id else None,'franchise_name':user.franchise.name if user.franchise_id else 'All franchises','warehouse':str(user.warehouse_id) if user.warehouse_id else None,'permission_version':user.permission_version,'capabilities':[k for k,v in GRANTS.items() if user.role in v]}
+    custom=getattr(user,'custom_role',None) if getattr(user,'custom_role_id',None) else None
+    return {'id':user.id,'name':user.get_full_name() or user.email,'email':user.email,'role':user.role,'role_label':custom.name if custom else user.get_role_display(),'access_role':'custom:'+str(custom.id) if custom else user.role,'custom_role':str(custom.id) if custom else None,'franchise':str(user.franchise_id) if user.franchise_id else None,'franchise_name':user.franchise.name if user.franchise_id else 'All franchises','warehouse':str(user.warehouse_id) if user.warehouse_id else None,'permission_version':user.permission_version,'capabilities':sorted(effective_permissions(user))}
 
 def throttle(key,limit=5):
     digest=hashlib.sha256(key.encode()).hexdigest()
@@ -58,6 +59,17 @@ class AuthView(APIView):
     def post(self,request,action):
         if action=='logout':
             logout(request);return Response({'ok':True})
+        if action=='change-password':
+            user=request.user
+            if not user.is_authenticated: raise PermissionDenied('Please sign in to change your password.')
+            current=str(request.data.get('current_password',''));password=str(request.data.get('password',''))
+            if not user.check_password(current): raise ValidationError({'current_password':'Current password is incorrect.'})
+            validate_password(password,user)
+            user.set_password(password);user.permission_version+=1;user.save()
+            request.session['permission_version']=user.permission_version
+            update_session_auth_hash(request,user)
+            AuditEvent.objects.create(actor=user,franchise_id=user.franchise_id,action='account.password_changed',resource=str(user.pk))
+            return Response({'detail':'Password changed successfully.'})
         if action=='login':
             email=str(request.data.get('email','')).strip().lower()
             throttle('login:'+email);throttle('source:'+request.META.get('REMOTE_ADDR',''),30)

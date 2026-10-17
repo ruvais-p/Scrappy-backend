@@ -7,7 +7,7 @@ OWN = {Role.DRIVER,Role.STAFF,Role.COLLECTOR}
 BILLING = {Role.SUPER,Role.ADMIN,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF}
 GRANTS = {
  'dashboard':set(Role.values), 'franchises':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF},
- 'customers':BILLING, 'bills':BILLING, 'payments':BILLING, 'earnings':{Role.SUPER,Role.ADMIN,Role.DIGESTER},
+ 'customers':BILLING, 'bills':BILLING, 'payments':BILLING|{Role.COLLECTOR}, 'earnings':{Role.SUPER,Role.ADMIN,Role.DIGESTER},
  'products':{Role.SUPER,Role.ADMIN}, 'categories':{Role.SUPER,Role.ADMIN},
  'rates':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER}, 'audit':{Role.SUPER,Role.HQ}, 'settings':{Role.SUPER},
  'team':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER},
@@ -16,21 +16,32 @@ GRANTS = {
  'loads':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE},
  'receipts':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.WAREHOUSE},
  'inventory':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.WAREHOUSE},
- 'requirements':{Role.HQ,Role.WAREHOUSE},'cash':{Role.HQ,Role.WAREHOUSE,Role.APP,Role.DRIVER,Role.COLLECTOR},
+ 'requirements':{Role.HQ,Role.WAREHOUSE,Role.APP},'cash':{Role.HQ,Role.WAREHOUSE,Role.APP,Role.DRIVER,Role.COLLECTOR},
  'imports':{Role.HQ},
+ 'role.write':{Role.SUPER,Role.ADMIN},
  'franchise.create':{Role.SUPER,Role.HQ}, 'franchise.edit':{Role.SUPER,Role.HQ},'franchise.suspend':{Role.SUPER},
  'customer.create':BILLING, 'customer.edit':{Role.SUPER,Role.ADMIN,Role.APP,Role.DIGESTER},
  'product.write':{Role.SUPER},'product.assign':{Role.SUPER},'rate.write':{Role.SUPER,Role.HQ},
 'lead.assign':{Role.HQ,Role.APP},'lead.schedule':{Role.HQ,Role.APP},'pickup.write':{Role.DRIVER,Role.COLLECTOR},
- 'bill.write':BILLING, 'receipt.write':{Role.WAREHOUSE},'requirement.write':{Role.HQ},'release.write':{Role.WAREHOUSE},
- 'float.write':{Role.HQ,Role.WAREHOUSE}, 'count.write':{Role.WAREHOUSE},'payout.write':{Role.SUPER,Role.ADMIN},
+ 'bill.write':BILLING, 'receipt.write':{Role.WAREHOUSE,Role.HQ},'requirement.write':{Role.HQ},'release.write':{Role.APP,Role.HQ},
+ 'float.write':{Role.HQ,Role.WAREHOUSE}, 'count.write':{Role.HQ,Role.WAREHOUSE},'handover.review':{Role.APP,Role.HQ},'payout.write':{Role.SUPER,Role.ADMIN},
+ 'load.unload':{Role.WAREHOUSE,Role.HQ},'load.resolve':{Role.HQ},
 }
+def effective_permissions(user):
+    if getattr(user,'custom_role_id',None):
+        allowed={key for key,roles in GRANTS.items() if user.role in roles}
+        return allowed.intersection(user.custom_role.permissions or [])
+    return {key for key,roles in GRANTS.items() if user.role in roles}
+
+def has_permission(user, action):
+    return action in effective_permissions(user)
+
 class PolicyUnavailable(APIException):
     status_code=409
     default_code='policy_unavailable'
 
 def require(user, action):
-    if not user.is_authenticated or not user.is_active or user.role not in GRANTS.get(action,set()):
+    if not user.is_authenticated or not user.is_active or not has_permission(user,action):
         raise PermissionDenied('This action is not available for your role.')
 
 def policy(key):

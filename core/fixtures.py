@@ -27,6 +27,13 @@ def synthetic_records(password=None,policies=False):
         p,_=Product.objects.get_or_create(name=name,category=category,defaults={'unit':'kg'})
         p.franchises.add(*books[:2]);products.append(p)
         if not Rate.objects.filter(product=p).exists(): Rate.objects.create(product=p,kind='collection',amount=rate,actor=accounts[Role.SUPER])
+    digester_category,_=Category.objects.get_or_create(name='Digester',kind='digester')
+    digester_product,_=Product.objects.get_or_create(name='Digester',category=digester_category,defaults={'unit':'piece'})
+    digester_franchises=[book for book in books if book.kind=='digester']
+    digester_product.franchises.add(*digester_franchises)
+    products.append(digester_product)
+    for book in digester_franchises:
+        Rate.objects.get_or_create(product=digester_product,franchise=book,kind='sale',defaults={'amount':500,'actor':accounts[Role.SUPER],'reason':'Digester product price per piece'})
     collector=accounts[Role.COLLECTOR]
     load,_=Load.objects.get_or_create(driver=collector,franchise=books[0],warehouse=warehouses[0])
     leads=[]

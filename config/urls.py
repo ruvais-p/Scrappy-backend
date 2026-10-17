@@ -1,14 +1,17 @@
 from django.urls import path
 from drf_spectacular.views import SpectacularAPIView
 from core.auth import AuthView
-from core.views import RegisterView,CommandView,CashView,DashboardView,OptionsView,SettingsView,TeamView,ReconciliationView,PayoutView,TimelineView
+from core.views import RegisterView,CommandView,CashView,DashboardView,OptionsView,SettingsView,TeamView,RoleDefinitionsView,ReconciliationView,PayoutView,TimelineView
 from core.events import stream
 from core.documents import BillPDF,ShareLink,CustomerPDF,PDFJobView,RevokeCustomerLinks
 from core.jobs import ExportView,DownloadView,JobStatusView,AuditDeliveryView
 from core.health import live,ready
 from core.views import ReconciliationQueueView
 from core.inventory_reports import InventoryReportView
+from core.presentation import SearchView,PricingView
 urlpatterns=[
+ path('api/v1/search/',SearchView.as_view()),
+ path('api/v1/pricing/',PricingView.as_view()),
  path('api/v1/inventory-report/',InventoryReportView.as_view()),
  path('api/health/live/',live),
  path('api/health/ready/',ready),
@@ -25,6 +28,7 @@ urlpatterns=[
  path('api/v1/timeline/<str:feature>/<uuid:pk>/',TimelineView.as_view()),
  path('api/v1/payouts/',PayoutView.as_view()),
  path('api/v1/team/',TeamView.as_view()),
+ path('api/v1/role-definitions/',RoleDefinitionsView.as_view()),
  path('api/v1/options/',OptionsView.as_view()),
  path('api/v1/driver-cash/',CashView.as_view()),
  path('api/v1/settings/<str:section>/save/',SettingsView.as_view()),

@@ -5,6 +5,28 @@ from core.models import *
 from core.policy import *
 from .common import version,event,Conflict
 
+def ensure_load(actor,lead):
+    """Attach a pickup to its driver's current route, creating that route if needed."""
+    if lead.load_id:
+        load=lead.load
+        if load.driver_id!=lead.driver_id or load.franchise_id!=lead.franchise_id:
+            raise Conflict('This pickup is attached to a different driver route. Ask HQ to review it.')
+        return load
+    if not lead.driver_id:
+        raise Conflict('Assign this pickup to a collector before adding it to a load.')
+    load=Load.objects.filter(driver_id=lead.driver_id,franchise_id=lead.franchise_id,
+                             state='on_route',counted_in__isnull=True).order_by('-created_at','pk').first()
+    if not load:
+        warehouse=Warehouse.objects.filter(franchise_id=lead.franchise_id).order_by('created_at','pk').first()
+        if not warehouse:
+            raise Conflict('Set up a warehouse for this franchise before starting a collector route.')
+        load=Load.objects.create(driver_id=lead.driver_id,franchise_id=lead.franchise_id,warehouse=warehouse)
+    lead.load=load
+    lead.version+=1
+    lead.save(update_fields=['load','version','updated_at'])
+    event(actor,'loads',load,{'lead':str(lead.pk)},'load.pickup_linked')
+    return load
+
 @transaction.atomic
 def assign(actor,lead,data):
     require(actor,'lead.assign');book_allowed(actor,lead.franchise);version(lead,data.get('version'))
@@ -27,7 +49,7 @@ def start(actor,lead,data):
     if lead.state=='weighing' and not lead.started_at:
         raise Conflict('Pickup state is inconsistent. Refresh the assigned lead.')
     if lead.state=='scheduled':
-        version(lead,data.get('version'));lead.state='weighing';lead.started_at=timezone.now();lead.version+=1;lead.save()
+        version(lead,data.get('version'));ensure_load(actor,lead);lead.state='weighing';lead.started_at=timezone.now();lead.version+=1;lead.save()
     elif data.get('version') is not None and str(data['version'])!=str(lead.version):
         raise Conflict('This pickup changed. Refresh before continuing.')
     bill,_=Bill.objects.get_or_create(lead=lead,defaults={'franchise':lead.franchise,'creator':actor,'customer':lead.customer,'kind':'collection'})

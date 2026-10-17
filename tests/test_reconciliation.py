@@ -104,6 +104,21 @@ def test_on_route_foreign_warehouse_and_missing_policy(data,client_for):
 
 
 @pytest.mark.django_db
+def test_warehouse_manager_records_unload_before_reconciliation(data,client_for):
+    lead,bill=prepared(data)
+    load=data['load'];load.state='on_route';load.returned_at=None;load.unloaded_at=None;load.eligibility_reference='';load.save()
+    client=client_for(data['users'][Role.WAREHOUSE])
+    assert not client.get(f'/api/v1/reconciliation/{lead.pk}/').data['can_edit']
+    response=post(client,f'loads/{load.pk}/unload/',{'version':load.version,'reference':'Gate pass 481'},str(uuid.uuid4()))
+    assert response.status_code==200,response.data
+    load.refresh_from_db()
+    assert load.state=='returned' and load.returned_at and load.unloaded_at
+    assert load.eligibility_reference=='Gate pass 481'
+    assert client.get(f'/api/v1/reconciliation/{lead.pk}/').data['can_edit']
+    assert AuditEvent.objects.filter(resource=str(load.pk),action='load.unloaded').exists()
+
+
+@pytest.mark.django_db
 def test_paid_closed_lead_still_receivable(data,client_for):
     lead,bill=prepared(data)
     with transaction.atomic():

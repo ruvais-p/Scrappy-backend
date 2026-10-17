@@ -60,6 +60,27 @@ def test_draft_issue_snapshot_payment_and_receipt(data,client_for):
     bill.refresh_from_db();assert bill.total==280 and bill.state=='completed'
 
 @pytest.mark.django_db
+def test_completed_legacy_pickup_is_attached_to_load_and_refreshes_load_register(data,client_for):
+    lead=data['leads'][0]
+    lead.load=None;lead.save(update_fields=['load'])
+    bill=issue_pickup(data)
+    user=data['users'][Role.COLLECTOR]
+    response=post(client_for(user),f'pickups/{bill.id}/pay/',{'amount':str(bill.total),'method':'UPI','reference':'TEST-UPI-LOAD','version':bill.version})
+    assert response.status_code==200,response.data
+    lead.refresh_from_db();assert lead.load_id==data['load'].id and lead.state=='closed'
+    response=client_for(user).get('/api/v1/loads/')
+    assert response.status_code==200,response.data
+    row=next(result for result in response.data['results'] if result['id']==str(data['load'].id))
+    assert row['pickup_count']==3 and row['paid_pickups']==1 and row['pickup_settled']=='280.00'
+    pickup=next(result for result in row['pickups'] if result['id']==str(lead.id))
+    assert pickup['bill_number']==bill.number and pickup['bill_state']=='completed'
+    assert pickup['total']=='280.00' and pickup['settled']=='280.00' and pickup['outstanding']=='0.00'
+    payments=client_for(user).get('/api/v1/payments/?direction=outgoing')
+    assert payments.status_code==200,payments.data
+    assert len(payments.data['results'])==1
+    assert payments.data['results'][0]['bill_number']==bill.number
+
+@pytest.mark.django_db
 def test_policy_gate_in_production(data,settings):
     settings.ENVIRONMENT='production'
     with pytest.raises(PolicyUnavailable):policy('billing_issue')

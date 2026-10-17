@@ -24,6 +24,12 @@ class Record(models.Model):
         abstract = True
         ordering = ['-created_at']
 
+class RoleDefinition(Record):
+    name = models.CharField(max_length=80, unique=True)
+    base_role = models.CharField(max_length=30, choices=Role.choices)
+    permissions = models.JSONField(default=list)
+    created_by = models.ForeignKey('User', null=True, blank=True, on_delete=models.SET_NULL, related_name='created_role_definitions')
+
 class Franchise(Record):
     name = models.CharField(max_length=160)
     code = models.CharField(max_length=12, unique=True)
@@ -48,6 +54,7 @@ class Warehouse(Record):
 class User(AbstractUser):
     email = models.EmailField(unique=True)
     role = models.CharField(max_length=30,choices=Role.choices)
+    custom_role = models.ForeignKey(RoleDefinition,null=True,blank=True,on_delete=models.SET_NULL,related_name='users')
     franchise = models.ForeignKey(Franchise,null=True,blank=True,on_delete=models.PROTECT)
     warehouse = models.ForeignKey(Warehouse,null=True,blank=True,on_delete=models.PROTECT)
     permission_version = models.PositiveIntegerField(default=1)
@@ -61,6 +68,8 @@ class User(AbstractUser):
         constraints = [models.CheckConstraint(condition=(Q(role__in=['super_admin','admin','hq_manager'],franchise__isnull=True,warehouse__isnull=True)|Q(role__in=['app_franchise_manager','delivery_staff','digester_franchise_admin','digester_staff','collector'],franchise__isnull=False,warehouse__isnull=True)|Q(role='warehouse_manager',franchise__isnull=False,warehouse__isnull=False)),name='role_scope_required')]
     def clean(self):
         super().clean()
+        if self.custom_role_id and self.custom_role.base_role != self.role:
+            raise ValidationError('The assigned custom role must use the account role scope.')
         if self.role in [Role.SUPER,Role.ADMIN,Role.HQ]:
             if self.franchise_id or self.warehouse_id: raise ValidationError('Network accounts must not have a fixed franchise.')
         else:
@@ -124,6 +133,12 @@ class Load(Record):
     returned_at = models.DateTimeField(null=True,blank=True)
     unloaded_at = models.DateTimeField(null=True,blank=True)
     eligibility_reference = models.CharField(max_length=500,blank=True)
+    reconciliation_state = models.CharField(max_length=24,default='pending')
+    reweigh_version = models.PositiveIntegerField(default=1)
+    resolution_action = models.CharField(max_length=24,blank=True)
+    resolution_note = models.CharField(max_length=1000,blank=True)
+    resolved_by = models.ForeignKey('User',null=True,blank=True,on_delete=models.PROTECT,related_name='resolved_loads')
+    resolved_at = models.DateTimeField(null=True,blank=True)
 
 class Lead(Record):
     franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT)
@@ -200,6 +215,9 @@ class Handover(Record):
     note = models.CharField(max_length=1000,blank=True)
     state = models.CharField(max_length=30,default='awaiting_supervisor')
     cutoff = models.DateTimeField()
+    reviewed_by = models.ForeignKey(User,null=True,blank=True,on_delete=models.PROTECT,related_name='reviewed_handovers')
+    reviewed_at = models.DateTimeField(null=True,blank=True)
+    review_note = models.CharField(max_length=1000,blank=True)
 
 class HandoverRoute(models.Model):
     handover = models.ForeignKey(Handover,on_delete=models.PROTECT,related_name='routes')
@@ -222,6 +240,17 @@ class Receipt(Record):
     note = models.CharField(max_length=1000,blank=True)
     submitted_at = models.DateTimeField(null=True,blank=True)
     flagged = models.BooleanField(default=False)
+    revision = models.PositiveIntegerField(default=1)
+
+class ReceiptRevision(Record):
+    receipt = models.ForeignKey(Receipt,on_delete=models.PROTECT,related_name='revisions')
+    actor = models.ForeignKey(User,on_delete=models.PROTECT)
+    revision = models.PositiveIntegerField()
+    lines = models.JSONField(default=list)
+    note = models.CharField(max_length=1000,blank=True)
+    submitted_at = models.DateTimeField(null=True,blank=True)
+    flagged = models.BooleanField(default=False)
+    superseded_at = models.DateTimeField(null=True,blank=True)
 
 class StockBalance(models.Model):
     warehouse = models.ForeignKey(Warehouse,on_delete=models.PROTECT)
@@ -250,9 +279,10 @@ class StockMovement(Record):
     quantity = models.DecimalField(max_digits=18,decimal_places=3)
     kind = models.CharField(max_length=20)
     receipt = models.ForeignKey(Receipt,null=True,blank=True,on_delete=models.PROTECT)
+    receipt_revision = models.ForeignKey(ReceiptRevision,null=True,blank=True,on_delete=models.PROTECT)
     requirement = models.ForeignKey(Requirement,null=True,blank=True,on_delete=models.PROTECT)
     class Meta(Record.Meta):
-        constraints = [models.UniqueConstraint(fields=['receipt','product'],condition=Q(receipt__isnull=False),name='once_per_receipt_product')]
+        constraints = [models.UniqueConstraint(fields=['receipt','product'],condition=Q(receipt__isnull=False),name='once_per_receipt_product'),models.UniqueConstraint(fields=['receipt_revision','product'],condition=Q(receipt_revision__isnull=False),name='once_per_reweigh_product')]
 
 class AuditEvent(Record):
     actor = models.ForeignKey(User,null=True,on_delete=models.PROTECT)

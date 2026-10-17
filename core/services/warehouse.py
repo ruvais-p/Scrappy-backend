@@ -20,18 +20,50 @@ def receipt_context(actor, lead, data):
     if not lead.load_id:
         raise Conflict('A warehouse load association is required.')
     load = Load.objects.select_for_update().get(pk=lead.load_id)
-    if (load.warehouse_id != actor.warehouse_id or load.franchise_id != lead.franchise_id
+    if ((actor.role==Role.WAREHOUSE and load.warehouse_id != actor.warehouse_id) or load.franchise_id != lead.franchise_id
             or load.state != 'returned' or not load.unloaded_at or not load.eligibility_reference):
         raise Conflict('Valid unloading evidence on a returned load in your warehouse is required.')
-    if Receipt.objects.filter(lead=lead, submitted_at__isnull=False).exists():
-        raise Conflict('This lead has already been received.')
+    receipt=Receipt.objects.filter(lead=lead).first()
+    reweigh=load.reconciliation_state=='reweigh_requested'
+    if receipt and receipt.submitted_at and (not reweigh or receipt.revision>=load.reweigh_version):
+        raise Conflict('This lead has already been received for the current weighing.')
     try:
         bill = lead.bill
     except Bill.DoesNotExist:
         raise Conflict('A source bill is required.')
     if bill.state not in ('issued', 'completed', 'cancellation_requested'):
         raise Conflict('Source bill must be issued.')
-    return bill
+    return bill,load,load.warehouse_id,reweigh
+
+
+def update_load_reconciliation(actor,load):
+    eligible=Lead.objects.filter(load=load,bill__state__in=['issued','completed','cancellation_requested'])
+    total=eligible.count()
+    if not total:return
+    receipts=Receipt.objects.filter(lead__in=eligible,submitted_at__isnull=False)
+    if receipts.count()!=total:return
+    if load.reconciliation_state=='reweigh_requested' and receipts.filter(revision__lt=load.reweigh_version).exists():return
+    state='flagged' if receipts.filter(flagged=True).exists() else 'reconciled'
+    if load.reconciliation_state!=state:
+        load.reconciliation_state=state
+        load.version+=1
+        load.save(update_fields=['reconciliation_state','version','updated_at'])
+        event(actor,'loads',load,{'reconciliation_state':state},'load.reconciliation_completed')
+
+
+def adjust_reweighed_stock(actor,receipt,archive,warehouse_id,new_lines):
+    old={line['product']:Decimal(line['actual']) for line in receipt.lines}
+    new={line['product']:Decimal(line['actual']) for line in new_lines}
+    for product_id in sorted(set(old)|set(new)):
+        delta=new.get(product_id,Decimal('0'))-old.get(product_id,Decimal('0'))
+        if not delta:continue
+        balance,_=StockBalance.objects.get_or_create(warehouse_id=warehouse_id,product_id=product_id)
+        balance=StockBalance.objects.select_for_update().get(pk=balance.pk)
+        if balance.quantity+delta<0:
+            raise Conflict('Reweigh would reduce stock below zero because some received material has already been released.')
+        balance.quantity+=delta;balance.version+=1;balance.save()
+        StockMovement.objects.create(warehouse_id=warehouse_id,product_id=product_id,actor=actor,
+                                     quantity=delta,kind='receipt_adjustment',receipt_revision=archive)
 
 
 def measurement_lines(lead, bill, supplied, complete=True):
@@ -60,14 +92,38 @@ def measurement_lines(lead, bill, supplied, complete=True):
 
 
 def save_measurements(actor, lead, data, submit=False):
-    bill = receipt_context(actor, lead, data)
+    bill,load,warehouse_id,reweigh = receipt_context(actor, lead, data)
     output = measurement_lines(lead, bill, data.get('lines', []), complete=submit)
     note = str(data.get('note', ''))
     if len(note) > 1000:
         raise ValidationError('Warehouse note must be at most 1,000 characters.')
-    receipt, _ = Receipt.objects.get_or_create(lead=lead, defaults={'warehouse_id': actor.warehouse_id, 'actor': actor})
-    if receipt.warehouse_id != actor.warehouse_id:
+    receipt, _ = Receipt.objects.get_or_create(lead=lead, defaults={'warehouse_id': warehouse_id, 'actor': actor})
+    if receipt.warehouse_id != warehouse_id:
         raise Conflict('The saved reconciliation belongs to a different warehouse.')
+    if reweigh and receipt.submitted_at:
+        if not submit:
+            draft,_=ReceiptRevision.objects.get_or_create(receipt=receipt,revision=load.reweigh_version,
+                submitted_at__isnull=True,superseded_at__isnull=True,
+                defaults={'actor':actor,'lines':output,'note':note,'flagged':any(line['flagged'] for line in output)})
+            draft.actor=actor;draft.lines=output;draft.note=note;draft.flagged=any(line['flagged'] for line in output)
+            draft.version+=1;draft.save()
+            lead.version+=1;lead.save(update_fields=['version','updated_at'])
+            event(actor,'receipts',receipt,{'flagged':draft.flagged,'revision':load.reweigh_version},'receipt.reweigh_draft_saved')
+            receipt.lines=output;receipt.note=note;receipt.pending_reweigh=True
+            return receipt
+        archive=ReceiptRevision.objects.create(receipt=receipt,actor=receipt.actor,revision=receipt.revision,
+            lines=receipt.lines,note=receipt.note,submitted_at=receipt.submitted_at,flagged=receipt.flagged,
+            superseded_at=timezone.now())
+        adjust_reweighed_stock(actor,receipt,archive,warehouse_id,output)
+        ReceiptRevision.objects.filter(receipt=receipt,revision=load.reweigh_version,
+            submitted_at__isnull=True,superseded_at__isnull=True).delete()
+        receipt.revision=load.reweigh_version
+        receipt.lines=output;receipt.note=note;receipt.actor=actor;receipt.flagged=any(line['flagged'] for line in output)
+        receipt.submitted_at=timezone.now();receipt.version+=1;receipt.save()
+        lead.version+=1;lead.save(update_fields=['version','updated_at'])
+        event(actor,'receipts',receipt,{'flagged':receipt.flagged,'revision':receipt.revision},'receipt.reweighed')
+        update_load_reconciliation(actor,load)
+        return receipt
     receipt.lines = output
     receipt.note = note
     receipt.actor = actor
@@ -75,21 +131,23 @@ def save_measurements(actor, lead, data, submit=False):
     receipt.version += 1
     if submit:
         receipt.submitted_at = timezone.now()
+        receipt.revision=load.reweigh_version
     receipt.save()
     if submit:
         for line in sorted(output, key=lambda item: item['product']):
             qty = Decimal(line['actual'])
             if qty > 0:
-                balance, _ = StockBalance.objects.get_or_create(warehouse_id=actor.warehouse_id, product_id=line['product'])
+                balance, _ = StockBalance.objects.get_or_create(warehouse_id=warehouse_id, product_id=line['product'])
                 balance = StockBalance.objects.select_for_update().get(pk=balance.pk)
                 balance.quantity += qty
                 balance.version += 1
                 balance.save()
-                StockMovement.objects.create(warehouse_id=actor.warehouse_id, product_id=line['product'], actor=actor,
+                StockMovement.objects.create(warehouse_id=warehouse_id, product_id=line['product'], actor=actor,
                                              quantity=qty, kind='receipt', receipt=receipt)
     lead.version += 1
     lead.save(update_fields=['version'])
     event(actor, 'receipts', receipt, {'flagged': receipt.flagged}, 'receipt.submitted' if submit else 'receipt.draft_saved')
+    if submit:update_load_reconciliation(actor,load)
     return receipt
 
 
@@ -136,11 +194,45 @@ def release(actor,request,data):
     require(actor,'release.write');book_allowed(actor,request.franchise);version(request,data.get('version'))
     if request.state!='active' or request.released>=request.quantity: raise Conflict('This requirement is not open.')
     qty=decimal(data.get('quantity'),3)
-    balance=StockBalance.objects.select_for_update().filter(warehouse_id=actor.warehouse_id,product=request.product).first()
+    warehouse_id=data.get('warehouse')
+    warehouse=Warehouse.objects.filter(pk=warehouse_id,franchise=request.franchise).first()
+    if not warehouse: raise ValidationError('Choose a warehouse in the requirement franchise.')
+    balance=StockBalance.objects.select_for_update().filter(warehouse=warehouse,product=request.product).first()
     if not balance or qty>balance.quantity or qty>request.quantity-request.released: raise Conflict('Release exceeds available stock or remaining demand.')
     balance.quantity-=qty;balance.version+=1;balance.save()
-    movement=StockMovement.objects.create(warehouse_id=actor.warehouse_id,product=request.product,actor=actor,quantity=-qty,kind='release',requirement=request)
+    movement=StockMovement.objects.create(warehouse=warehouse,product=request.product,actor=actor,quantity=-qty,kind='release',requirement=request)
     request.released+=qty;request.version+=1
     if request.released==request.quantity: request.state='fulfilled'
     request.save();event(actor,'inventory',movement,action='stock.released');event(actor,'requirements',request,action='requirement.progress')
     return request
+
+
+@transaction.atomic
+def resolve_flagged_load(actor,load,data):
+    require(actor,'load.resolve')
+    load=Load.objects.select_for_update().get(pk=load.pk)
+    version(load,data.get('version'))
+    if load.reconciliation_state!='flagged':
+        raise Conflict('Only a completed flagged load can be resolved.')
+    decision=data.get('decision')
+    if decision not in ('accept','reweigh'):
+        raise ValidationError('Choose accept or request a reweigh.')
+    note=data.get('note','')
+    if not isinstance(note,str) or not note.strip():
+        raise ValidationError('Enter a resolution note.')
+    note=note.strip()
+    if len(note)>1000: raise ValidationError('Resolution note must be at most 1,000 characters.')
+    if decision=='reweigh':
+        load.reweigh_version+=1
+        load.reconciliation_state='reweigh_requested'
+    else:
+        load.reconciliation_state='reconciled'
+    load.resolution_action='accepted' if decision=='accept' else 'reweigh'
+    load.resolution_note=note
+    load.resolved_by=actor
+    load.resolved_at=timezone.now()
+    load.version+=1
+    load.save(update_fields=['reconciliation_state','reweigh_version','resolution_action','resolution_note',
+                             'resolved_by','resolved_at','version','updated_at'])
+    event(actor,'loads',load,{'decision':decision,'note':note,'reweigh_version':load.reweigh_version},'load.flagged_resolved')
+    return load

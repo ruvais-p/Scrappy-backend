@@ -120,6 +120,10 @@ def pay(actor,bill,data):
         if lead.driver_id!=actor.id or not lead.agreed_at: raise PermissionDenied('Customer agreement on your assigned pickup is required.')
         if amount!=bill.total-bill.settled: raise PolicyUnavailable('Partial pickup payment policy is not defined.')
         if method not in ('Cash','UPI'): raise ValidationError('Pickup payment must be Cash or UPI.')
+        # Older pickups may predate route linking. Ensure the settled pickup is
+        # included in the collector's current load before closing it.
+        from .pickups import ensure_load
+        ensure_load(actor,lead)
     payment=Payment.objects.create(bill=bill,actor=actor,amount=amount,method=method,reference=reference,paid_at=timezone.now())
     if lead and method=='Cash':
         from .cash import move

@@ -19,8 +19,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: {}
+                $ref: '#/components/schemas/RegisterResponse'
           description: ''
     post:
       operationId: root_create
@@ -30,11 +29,30 @@ paths:
         schema:
           type: string
         required: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: {}
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: {}
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: {}
       security:
       - cookieAuth: []
       responses:
         '200':
-          description: No response body
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
   /api/v1/{feature}/{id}/:
     get:
       operationId: root_retrieve_2
@@ -57,8 +75,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: {}
+                $ref: '#/components/schemas/RegisterResponse'
           description: ''
     post:
       operationId: root_create_2
@@ -74,11 +91,30 @@ paths:
           type: string
           format: uuid
         required: true
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: {}
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              additionalProperties: {}
+          multipart/form-data:
+            schema:
+              type: object
+              additionalProperties: {}
       security:
       - cookieAuth: []
       responses:
         '200':
-          description: No response body
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
   /api/v1/{feature}/{id}/{action}/:
     post:
       operationId: root_create_3
@@ -242,8 +278,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: {}
+                $ref: '#/components/schemas/DashboardResponse'
           description: ''
   /api/v1/documents/{id}/pdf/:
     get:
@@ -456,7 +491,12 @@ paths:
       - cookieAuth: []
       responses:
         '200':
-          description: No response body
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
   /api/v1/jobs/{id}/:
     get:
       operationId: jobs_retrieve
@@ -528,8 +568,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: {}
+                $ref: '#/components/schemas/EarningsResponse'
           description: ''
     post:
       operationId: payouts_create
@@ -558,6 +597,20 @@ paths:
               schema:
                 type: object
                 additionalProperties: {}
+          description: ''
+  /api/v1/pricing/:
+    get:
+      operationId: pricing_retrieve
+      tags:
+      - pricing
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PricingResponse'
           description: ''
   /api/v1/reconciliation-queue/:
     get:
@@ -630,6 +683,20 @@ paths:
               schema:
                 type: object
                 additionalProperties: {}
+          description: ''
+  /api/v1/search/:
+    get:
+      operationId: search_retrieve
+      tags:
+      - search
+      security:
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
           description: ''
   /api/v1/settings/{section}/save/:
     post:
@@ -737,6 +804,286 @@ paths:
                 additionalProperties: {}
           description: ''
 components:
+  schemas:
+    DashboardResponse:
+      type: object
+      properties:
+        identity:
+          type: object
+          additionalProperties: {}
+        date:
+          type: string
+          format: date
+        pickup_chart:
+          type: object
+          additionalProperties: {}
+        metrics:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        bills:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        leads:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        summary:
+          $ref: '#/components/schemas/WorkspaceSummary'
+        franchises:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceFranchise'
+        cancellations:
+          type: integer
+      required:
+      - metrics
+    EarningsFranchise:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        share_percent:
+          type: string
+        billed:
+          type: string
+        collected:
+          type: string
+        earned:
+          type: string
+        paid:
+          type: string
+        balance:
+          type: string
+      required:
+      - balance
+      - billed
+      - collected
+      - earned
+      - id
+      - name
+      - paid
+      - share_percent
+    EarningsResponse:
+      type: object
+      properties:
+        balance:
+          type: string
+        can_payout:
+          type: boolean
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        franchises:
+          type: array
+          items:
+            $ref: '#/components/schemas/EarningsFranchise'
+        summary:
+          type: object
+          additionalProperties:
+            type: string
+      required:
+      - balance
+      - can_payout
+      - franchises
+      - results
+      - summary
+    PricingCell:
+      type: object
+      properties:
+        franchise:
+          type: string
+          format: uuid
+        amount:
+          type: string
+          nullable: true
+        override:
+          type: boolean
+        eligible:
+          type: boolean
+      required:
+      - amount
+      - eligible
+      - franchise
+      - override
+    PricingFranchise:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        kind:
+          type: string
+      required:
+      - id
+      - kind
+      - name
+    PricingProduct:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        category_name:
+          type: string
+        unit:
+          type: string
+        default:
+          type: string
+          nullable: true
+        cells:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingCell'
+      required:
+      - category_name
+      - cells
+      - default
+      - id
+      - name
+      - unit
+    PricingResponse:
+      type: object
+      properties:
+        franchises:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingFranchise'
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/PricingProduct'
+      required:
+      - franchises
+      - results
+    RegisterResponse:
+      type: object
+      properties:
+        count:
+          type: integer
+        page:
+          type: integer
+        page_size:
+          type: integer
+        date_basis:
+          type: string
+        summary:
+          type: object
+          additionalProperties: {}
+        results:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+      required:
+      - count
+      - date_basis
+      - page
+      - page_size
+      - results
+      - summary
+    ScreenEnum:
+      enum:
+      - bills
+      - customers
+      type: string
+      description: |-
+        * `bills` - bills
+        * `customers` - customers
+    SearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchResult'
+      required:
+      - results
+    SearchResult:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        screen:
+          $ref: '#/components/schemas/ScreenEnum'
+        type:
+          type: string
+        name:
+          type: string
+        detail:
+          type: string
+      required:
+      - detail
+      - id
+      - name
+      - screen
+      - type
+    WorkspaceFranchise:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        kind:
+          type: string
+        today:
+          type: string
+        month:
+          type: string
+        count:
+          type: integer
+        receivable:
+          type: string
+        payable:
+          type: string
+        share_owed:
+          type: string
+          nullable: true
+      required:
+      - count
+      - id
+      - kind
+      - month
+      - name
+      - payable
+      - receivable
+      - share_owed
+      - today
+    WorkspaceSummary:
+      type: object
+      properties:
+        today:
+          type: string
+        month:
+          type: string
+        incoming_outstanding:
+          type: string
+        outgoing_outstanding:
+          type: string
+        share_owed:
+          type: string
+      required:
+      - incoming_outstanding
+      - month
+      - outgoing_outstanding
+      - share_owed
+      - today
   securitySchemes:
     cookieAuth:
       type: apiKey

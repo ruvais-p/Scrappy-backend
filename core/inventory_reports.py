@@ -6,6 +6,7 @@ from django.utils import timezone
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from drf_spectacular.utils import extend_schema
 from .models import StockMovement, StockBalance
 from .policy import scope
 
@@ -21,6 +22,7 @@ def report_filters(request, queryset):
 
 
 class InventoryReportView(APIView):
+    @extend_schema(responses=dict)
     def get(self, request):
         today=timezone.localdate()
         try:

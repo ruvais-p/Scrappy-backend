@@ -30,7 +30,7 @@ def count(actor,driver,data):
     require(actor,'count.write');book_allowed(actor,driver.franchise);policy('route_eligibility')
     if not driver.is_active or driver.role not in (Role.DRIVER,Role.COLLECTOR):
         raise ValidationError('Select an active driver or Collector.')
-    if not actor.warehouse_id or actor.warehouse.franchise_id!=driver.franchise_id:
+    if actor.role==Role.WAREHOUSE and (not actor.warehouse_id or actor.warehouse.franchise_id!=driver.franchise_id):
         raise PermissionDenied('An assigned warehouse in this franchise is required for counting.')
     row=account(driver);version(row,data.get('version'))
     # The account lock serializes every cash movement. Capture the ledger
@@ -46,7 +46,7 @@ def count(actor,driver,data):
     loads=list(Load.objects.filter(driver=driver,counted_in__isnull=True).order_by('id'))
     if not loads: raise Conflict('No eligible uncounted routes.')
     if any(l.state=='on_route' for l in loads): raise Conflict('Driver still out.')
-    if any(l.franchise_id!=driver.franchise_id or l.warehouse_id!=actor.warehouse_id for l in loads):
+    if any(l.franchise_id!=driver.franchise_id or (actor.role==Role.WAREHOUSE and l.warehouse_id!=actor.warehouse_id) for l in loads):
         raise PermissionDenied('All covered routes must belong to your assigned warehouse.')
     if any(l.state!='returned' or not l.returned_at or l.returned_at>cutoff or not l.eligibility_reference.strip() for l in loads):
         raise Conflict('Valid route-return evidence is required before counting.')
@@ -63,3 +63,32 @@ def count(actor,driver,data):
     move(actor,driver,-received,'handover',handover=h)
     event(actor,'cash',h,{'expected':str(h.expected),'received':str(received),'difference':str(difference)},'cash.counted')
     return h
+
+@transaction.atomic
+def review_handover(actor,handover,data):
+    require(actor,'handover.review');book_allowed(actor,handover.franchise)
+    handover=Handover.objects.select_for_update().get(pk=handover.pk)
+    version(handover,data.get('version'))
+    if handover.counter_id==actor.pk:
+        raise PermissionDenied('The person who counted this cash cannot review it.')
+    if handover.state!='awaiting_supervisor':
+        raise Conflict('This cash count has already been reviewed.')
+    decision=data.get('decision')
+    if decision not in ('verified','disputed'):
+        raise ValidationError('Choose verify or dispute for this cash count.')
+    note=data.get('note','')
+    if not isinstance(note,str): raise ValidationError('Enter a text review note.')
+    note=note.strip()
+    if decision=='disputed' and not note:
+        raise ValidationError('A note is required when disputing a cash count.')
+    if handover.difference and not note:
+        raise ValidationError('A note is required when reviewing a count with a difference.')
+    if len(note)>1000: raise ValidationError('Review note must be at most 1,000 characters.')
+    handover.state=decision
+    handover.reviewed_by=actor
+    handover.reviewed_at=timezone.now()
+    handover.review_note=note
+    handover.version+=1
+    handover.save(update_fields=['state','reviewed_by','reviewed_at','review_note','version','updated_at'])
+    event(actor,'handovers',handover,{'decision':decision,'difference':str(handover.difference),'note':note},'cash.'+decision)
+    return handover
