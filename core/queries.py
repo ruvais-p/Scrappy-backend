@@ -15,7 +15,7 @@ def filter_records(qs, feature, params):
         raise ValidationError('The end date must follow the start date.')
     if params.get('franchise_type') and params['franchise_type'] not in ('scrap','digester','hq'):
         raise ValidationError('Invalid franchise type.')
-    for key in ('state','kind'):
+    for key in ('state','kind','mode','transaction_type'):
         field=next((f for f in qs.model._meta.fields if f.name==key),None)
         if field and field.choices and params.get(key) and params[key] not in dict(field.choices):
             raise ValidationError(f'Invalid {key} filter.')
@@ -38,12 +38,14 @@ def filter_records(qs, feature, params):
         path={'payments':'bill__franchise_id','inventory':'warehouse__franchise_id','movements':'warehouse__franchise_id','receipts':'warehouse__franchise_id','franchises':'id','products':'franchises__id'}.get(feature,'franchise_id' if 'franchise' in fields else None)
         if path:
             qs=qs.filter(Q(franchise_id=selected_book)|Q(franchise__isnull=True)) if feature=='rates' else qs.filter(**{path:selected_book})
-    for field in ('franchise','driver','state','kind','warehouse','product','receipt','requirement'):
+    for field in ('franchise','driver','state','kind','mode','transaction_type','warehouse','product','receipt','requirement'):
         if field=='franchise': continue
         value=params.get(field)
         if value and field in fields: qs=qs.filter(**{field:value})
     if feature=='receipts' and params.get('flagged')=='1':
         qs=qs.filter(flagged=True,submitted_at__isnull=False)
+    if feature=='receipts' and params.get('explained')=='1':
+        qs=qs.exclude(explanation='')
     if feature=='audit':
         action=params.get('action','')[:100]
         actor=params.get('actor')
@@ -68,30 +70,31 @@ def filter_records(qs, feature, params):
     # Related-field filters shared by registers and exports.
     fields={f.name for f in qs.model._meta.fields}
     bill_prefix='bill__' if feature=='payments' else ''
-    if feature in ('bills','pickups','payments'):
+    if feature in ('bills','pickups','payments','quotations'):
         for key,path in [('franchise_type','franchise__kind'),('staff','creator_id'),('customer','customer_id')]:
             if params.get(key): qs=qs.filter(**{bill_prefix+path:params[key]})
-        direction=params.get('direction')
-        if direction:
-            if direction not in ('incoming','outgoing'): raise ValidationError('Invalid payment direction.')
-            qs=qs.filter(**{bill_prefix+'kind__in':['sale'] if direction=='incoming' else ['collection','b2b']})
-        state=params.get('payment_state')
-        if state:
-            if state not in ('paid','partial','pending','due'): raise ValidationError('Invalid payment state.')
-            qs=qs.exclude(**{bill_prefix+'state__in':['draft','cancelled']})
-            total=F(bill_prefix+'total')
-            if state=='paid': qs=qs.filter(**{bill_prefix+'settled__gte':total})
-            elif state=='partial': qs=qs.filter(**{bill_prefix+'settled__gt':0,bill_prefix+'settled__lt':total})
-            elif state=='pending': qs=qs.filter(**{bill_prefix+'settled':0})
-            else: qs=qs.filter(**{bill_prefix+'settled__lt':total})
-        if params.get('product') or params.get('category'):
-            products=Product.objects.all()
-            if params.get('product'): products=products.filter(pk=params['product'])
-            if params.get('category'): products=products.filter(category_id=params['category'])
-            line_query=Q(pk__in=[])
-            for product in products.values_list('pk',flat=True):
-                line_query |= Q(**{bill_prefix+'lines__contains':[{'product':str(product)}]})
-            qs=qs.filter(line_query)
+        if feature!='quotations':
+            direction=params.get('direction')
+            if direction:
+                if direction not in ('incoming','outgoing'): raise ValidationError('Invalid payment direction.')
+                qs=qs.filter(**{bill_prefix+'kind__in':['sale'] if direction=='incoming' else ['collection','b2b']})
+            state=params.get('payment_state')
+            if state:
+                if state not in ('paid','partial','pending','due'): raise ValidationError('Invalid payment state.')
+                qs=qs.exclude(**{bill_prefix+'state__in':['draft','cancelled']})
+                total=F(bill_prefix+'total')
+                if state=='paid': qs=qs.filter(**{bill_prefix+'settled__gte':total})
+                elif state=='partial': qs=qs.filter(**{bill_prefix+'settled__gt':0,bill_prefix+'settled__lt':total})
+                elif state=='pending': qs=qs.filter(**{bill_prefix+'settled':0})
+                else: qs=qs.filter(**{bill_prefix+'settled__lt':total})
+            if params.get('product') or params.get('category'):
+                products=Product.objects.all()
+                if params.get('product'): products=products.filter(pk=params['product'])
+                if params.get('category'): products=products.filter(category_id=params['category'])
+                line_query=Q(pk__in=[])
+                for product in products.values_list('pk',flat=True):
+                    line_query |= Q(**{bill_prefix+'lines__contains':[{'product':str(product)}]})
+                qs=qs.filter(line_query)
     if feature=='payments' and params.get('method'): qs=qs.filter(method=params['method'])
     if params.get('category') and feature in ('products','rates'):
         qs=qs.filter(**{('category_id' if feature=='products' else 'product__category_id'):params['category']})

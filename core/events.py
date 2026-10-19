@@ -9,8 +9,8 @@ from django.conf import settings
 from django.http import StreamingHttpResponse,JsonResponse
 from django.contrib.sessions.models import Session
 from django.utils import timezone
-from .models import User,Outbox,Rate
-from .policy import GRANTS,NETWORK,OWN,has_permission
+from .models import User,Outbox,Rate,Franchise
+from .policy import GRANTS,NETWORK,OWN,SEGMENT_NETWORK,has_permission
 STREAM='scrappy:events:v1'
 
 class Hub:
@@ -64,6 +64,10 @@ def allowed(user,event):
     if feature=='scope_reset': return str(user.pk)==str(event.get('owner_id'))
     if not has_permission(user,feature): return False
     if user.role in NETWORK: return True
+    if user.role in SEGMENT_NETWORK:
+        if feature=='rates':
+            return Rate.objects.filter(pk=event.get('resource_id'),product__category__kind=SEGMENT_NETWORK[user.role]).exists()
+        return bool(event.get('franchise_id') and Franchise.objects.filter(pk=event['franchise_id'],kind=SEGMENT_NETWORK[user.role]).exists())
     if event.get('franchise_id') and str(user.franchise_id)!=str(event['franchise_id']): return False
     if feature=='rates' and not Rate.objects.filter(pk=event.get('resource_id'),product__franchises=user.franchise_id).exists(): return False
     if user.role in OWN and str(user.pk)!=str(event.get('owner_id')): return False

@@ -1,13 +1,15 @@
 from django.conf import settings
 from django.db.models import Q
 from rest_framework.exceptions import PermissionDenied, NotFound, APIException
-from .models import Role, Policy, HandoverRoute
+from .models import Role, Policy, HandoverRoute, Rate
 NETWORK = {Role.SUPER, Role.ADMIN, Role.HQ}
+SEGMENT_NETWORK = {Role.APP_MANAGER: 'scrap', Role.DIGESTER_MANAGER: 'digester'}
 OWN = {Role.DRIVER,Role.STAFF,Role.COLLECTOR}
 BILLING = {Role.SUPER,Role.ADMIN,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF}
+TRACKING = {Role.APP_MANAGER, Role.DIGESTER_MANAGER}
 GRANTS = {
  'dashboard':set(Role.values), 'franchises':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF},
- 'customers':BILLING, 'bills':BILLING, 'payments':BILLING|{Role.COLLECTOR}, 'earnings':{Role.SUPER,Role.ADMIN,Role.DIGESTER},
+ 'customers':BILLING|TRACKING, 'bills':BILLING|TRACKING, 'quotations':BILLING|TRACKING, 'payments':BILLING|TRACKING|{Role.COLLECTOR}, 'earnings':{Role.SUPER,Role.ADMIN,Role.DIGESTER},
  'products':{Role.SUPER,Role.ADMIN}, 'categories':{Role.SUPER,Role.ADMIN},
  'rates':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER}, 'audit':{Role.SUPER,Role.HQ}, 'settings':{Role.SUPER},
  'team':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER},
@@ -17,21 +19,40 @@ GRANTS = {
  'receipts':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.WAREHOUSE},
  'inventory':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.WAREHOUSE},
  'requirements':{Role.HQ,Role.WAREHOUSE,Role.APP},'cash':{Role.HQ,Role.WAREHOUSE,Role.APP,Role.DRIVER,Role.COLLECTOR},
- 'imports':{Role.HQ},
+ 'imports':{Role.HQ},'inventory.adjust':{Role.SUPER,Role.ADMIN,Role.HQ},
  'role.write':{Role.SUPER,Role.ADMIN},
+ 'company.billing':BILLING,
+ 'company.billing.manage':{Role.SUPER,Role.ADMIN},
  'franchise.create':{Role.SUPER,Role.HQ}, 'franchise.edit':{Role.SUPER,Role.HQ},'franchise.suspend':{Role.SUPER},
  'customer.create':BILLING, 'customer.edit':{Role.SUPER,Role.ADMIN,Role.APP,Role.DIGESTER},
- 'product.write':{Role.SUPER},'product.assign':{Role.SUPER},'rate.write':{Role.SUPER,Role.HQ},
+'product.write':{Role.SUPER},'product.assign':{Role.SUPER},'rate.write':{Role.SUPER,Role.ADMIN,Role.HQ},
 'lead.assign':{Role.HQ,Role.APP},'lead.schedule':{Role.HQ,Role.APP},'pickup.write':{Role.DRIVER,Role.COLLECTOR},
- 'bill.write':BILLING, 'receipt.write':{Role.WAREHOUSE,Role.HQ},'requirement.write':{Role.HQ},'release.write':{Role.APP,Role.HQ},
+ 'bill.write':BILLING, 'quotation.write':BILLING, 'receipt.write':{Role.WAREHOUSE,Role.HQ},'requirement.write':{Role.HQ},'release.write':{Role.APP,Role.HQ},
  'float.write':{Role.HQ,Role.WAREHOUSE}, 'count.write':{Role.HQ,Role.WAREHOUSE},'handover.review':{Role.APP,Role.HQ},'payout.write':{Role.SUPER,Role.ADMIN},
- 'load.unload':{Role.WAREHOUSE,Role.HQ},'load.resolve':{Role.HQ},
+ 'load.unload':{Role.WAREHOUSE,Role.HQ},'load.resolve':{Role.HQ},'load.vehicle_full':{Role.DRIVER,Role.COLLECTOR},'receipt.explain':{Role.WAREHOUSE},
 }
 def effective_permissions(user):
+    role=user.role
+    if role in SEGMENT_NETWORK:
+        allowed={key for key,roles in GRANTS.items() if role in roles or Role.ADMIN in roles}
+        # App managers administer the scrap network; digester earnings remain
+        # exclusive to digester managers and finance roles.
+        if role==Role.APP_MANAGER:
+            allowed.discard('earnings')
+            allowed.discard('payout.write')
+    else:
+        allowed={key for key,roles in GRANTS.items() if role in roles}
     if getattr(user,'custom_role_id',None):
-        allowed={key for key,roles in GRANTS.items() if user.role in roles}
         return allowed.intersection(user.custom_role.permissions or [])
-    return {key for key,roles in GRANTS.items() if user.role in roles}
+    return allowed
+
+def role_permissions(role):
+    if role in SEGMENT_NETWORK:
+        allowed={key for key,roles in GRANTS.items() if role in roles or Role.ADMIN in roles}
+        if role==Role.APP_MANAGER:
+            allowed.discard('earnings');allowed.discard('payout.write')
+        return allowed
+    return {key for key,roles in GRANTS.items() if role in roles}
 
 def has_permission(user, action):
     return action in effective_permissions(user)
@@ -52,6 +73,28 @@ def policy(key):
 
 def scope(user, qs, feature):
     require(user,feature)
+    if user.role in SEGMENT_NETWORK:
+        model=qs.model.__name__
+        segment=SEGMENT_NETWORK[user.role]
+        if model=='Franchise': return qs.filter(kind=segment)
+        paths={
+            'Customer':'franchise__kind','Bill':'franchise__kind','Quotation':'franchise__kind',
+            'EarningsEntry':'franchise__kind','Payment':'bill__franchise__kind',
+            'Lead':'franchise__kind','Load':'franchise__kind','Requirement':'franchise__kind',
+            'CashMovement':'franchise__kind','Handover':'franchise__kind',
+            'Warehouse':'franchise__kind','Receipt':'warehouse__franchise__kind',
+            'StockBalance':'warehouse__franchise__kind','StockMovement':'warehouse__franchise__kind',
+            'DriverAccount':'driver__franchise__kind','HandoverRoute':'handover__franchise__kind',
+            'AuditEvent':'franchise__kind',
+        }
+        if model=='Category': return qs.filter(kind=segment)
+        if model=='Product': return qs.filter(category__kind=segment)
+        if model=='Rate': return qs.filter(product__category__kind=segment).filter(Q(franchise__kind=segment)|Q(franchise__isnull=True))
+        if model=='AuditEvent':
+            rate_ids=Rate.objects.filter(product__category__kind=segment).values('pk')
+            return qs.filter(Q(franchise__kind=segment)|Q(action='rate.changed',resource__in=rate_ids))
+        path=paths.get(model)
+        return qs.filter(**{path:segment}) if path else qs.none()
     if user.role in NETWORK: return qs
     model=qs.model.__name__
     paths={'Payment':'bill__franchise_id','StockBalance':'warehouse__franchise_id','StockMovement':'warehouse__franchise_id','Receipt':'warehouse__franchise_id','Rate':'franchise_id','Franchise':'id','Product':'franchises__id','Category':None,'DriverAccount':'driver__franchise_id','HandoverRoute':'handover__franchise_id'}
@@ -68,7 +111,7 @@ def scope(user, qs, feature):
     if model=='ImportBatch' and user.role not in NETWORK:
         qs=qs.filter(actor=user)
     if user.role in OWN:
-        if model=='Bill': qs=qs.filter(creator=user)
+        if model in ('Bill','Quotation'): qs=qs.filter(creator=user)
         elif model=='Payment': qs=qs.filter(bill__creator=user)
         elif model in ('Lead','Load','CashMovement','Handover','DriverAccount'): qs=qs.filter(driver=user)
         elif model=='EarningsEntry': return qs.none()
@@ -79,7 +122,9 @@ def scoped_get(user,qs,feature,pk):
     except (qs.model.DoesNotExist,ValueError): raise NotFound()
 
 def book_allowed(user,book):
-    if user.role not in NETWORK and user.franchise_id!=book.id: raise NotFound()
+    if user.role in SEGMENT_NETWORK:
+        if book.kind!=SEGMENT_NETWORK[user.role]: raise NotFound()
+    elif user.role not in NETWORK and user.franchise_id!=book.id: raise NotFound()
 
 def eligible_product(user,product,book):
     book_allowed(user,book)

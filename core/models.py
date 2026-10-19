@@ -7,6 +7,8 @@ from django.db.models import Q
 class Role(models.TextChoices):
     SUPER = 'super_admin', 'Super Admin'
     ADMIN = 'admin', 'Admin'
+    APP_MANAGER = 'app_manager', 'App Manager'
+    DIGESTER_MANAGER = 'digester_manager', 'Digester Manager'
     HQ = 'hq_manager', 'HQ Manager'
     APP = 'app_franchise_manager', 'App Franchise Manager'
     DRIVER = 'delivery_staff', 'Delivery Staff'
@@ -65,12 +67,12 @@ class User(AbstractUser):
     mfa_last_step = models.BigIntegerField(default=-1)
     recovery_hashes = models.JSONField(default=list,blank=True)
     class Meta:
-        constraints = [models.CheckConstraint(condition=(Q(role__in=['super_admin','admin','hq_manager'],franchise__isnull=True,warehouse__isnull=True)|Q(role__in=['app_franchise_manager','delivery_staff','digester_franchise_admin','digester_staff','collector'],franchise__isnull=False,warehouse__isnull=True)|Q(role='warehouse_manager',franchise__isnull=False,warehouse__isnull=False)),name='role_scope_required')]
+        constraints = [models.CheckConstraint(condition=(Q(role__in=['super_admin','admin','hq_manager','app_manager','digester_manager'],franchise__isnull=True,warehouse__isnull=True)|Q(role__in=['app_franchise_manager','delivery_staff','digester_franchise_admin','digester_staff','collector'],franchise__isnull=False,warehouse__isnull=True)|Q(role='warehouse_manager',franchise__isnull=False,warehouse__isnull=False)),name='role_scope_required')]
     def clean(self):
         super().clean()
         if self.custom_role_id and self.custom_role.base_role != self.role:
             raise ValidationError('The assigned custom role must use the account role scope.')
-        if self.role in [Role.SUPER,Role.ADMIN,Role.HQ]:
+        if self.role in [Role.SUPER,Role.ADMIN,Role.HQ,Role.APP_MANAGER,Role.DIGESTER_MANAGER]:
             if self.franchise_id or self.warehouse_id: raise ValidationError('Network accounts must not have a fixed franchise.')
         else:
             if not self.franchise_id: raise ValidationError('A franchise is required.')
@@ -93,6 +95,7 @@ class Customer(Record):
 class Category(Record):
     name = models.CharField(max_length=100)
     kind = models.CharField(max_length=12,choices=[('scrap','Scrap'),('digester','Digester')])
+    default_billing_mode = models.CharField(max_length=16,choices=[('franchise','Franchise Billing'),('company','Company Billing')],default='franchise')
     active = models.BooleanField(default=True)
 
 class Product(Record):
@@ -110,10 +113,11 @@ class Rate(Record):
     franchise = models.ForeignKey(Franchise,null=True,blank=True,on_delete=models.PROTECT)
     kind = models.CharField(max_length=16,choices=[('collection','Collection'),('b2b','B2B'),('sale','Sale')])
     amount = models.DecimalField(max_digits=14,decimal_places=2)
+    discount_percent = models.DecimalField(max_digits=5,decimal_places=2,default=0)
     actor = models.ForeignKey(User,on_delete=models.PROTECT)
     reason = models.CharField(max_length=500,blank=True)
     class Meta(Record.Meta):
-        constraints = [models.CheckConstraint(condition=Q(amount__gt=0),name='rate_positive')]
+        constraints = [models.CheckConstraint(condition=Q(amount__gt=0),name='rate_positive'),models.CheckConstraint(condition=Q(discount_percent__gte=0,discount_percent__lte=100),name='rate_discount_range')]
 
 class Policy(Record):
     key = models.CharField(max_length=80,unique=True)
@@ -130,6 +134,7 @@ class Load(Record):
     driver = models.ForeignKey(User,on_delete=models.PROTECT)
     warehouse = models.ForeignKey(Warehouse,on_delete=models.PROTECT)
     state = models.CharField(max_length=20,default='on_route')
+    vehicle_full_at = models.DateTimeField(null=True,blank=True)
     returned_at = models.DateTimeField(null=True,blank=True)
     unloaded_at = models.DateTimeField(null=True,blank=True)
     eligibility_reference = models.CharField(max_length=500,blank=True)
@@ -143,6 +148,7 @@ class Load(Record):
 class Lead(Record):
     franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT)
     customer = models.ForeignKey(Customer,on_delete=models.PROTECT)
+    franchise_manager = models.ForeignKey(User,null=True,blank=True,on_delete=models.PROTECT,related_name='managed_leads')
     driver = models.ForeignKey(User,null=True,blank=True,on_delete=models.PROTECT)
     load = models.ForeignKey(Load,null=True,blank=True,on_delete=models.PROTECT)
     pickup_date = models.DateField()
@@ -164,6 +170,9 @@ class Bill(Record):
     customer = models.ForeignKey(Customer,on_delete=models.PROTECT)
     lead = models.OneToOneField(Lead,null=True,blank=True,on_delete=models.PROTECT,related_name='bill')
     kind = models.CharField(max_length=20,choices=[('collection','Collection'),('sale','Sale'),('b2b','B2B')])
+    transaction_type = models.CharField(max_length=3,choices=[('B2B','B2B'),('B2C','B2C'),('B2G','B2G')],default='B2C')
+    mode = models.CharField(max_length=8,choices=[('purchase','Purchase'),('sales','Sales')],default='purchase')
+    billing_mode = models.CharField(max_length=16,choices=[('franchise','Franchise Billing'),('company','Company Billing')],default='franchise')
     state = models.CharField(max_length=24,default='draft')
     number = models.CharField(max_length=80,unique=True,null=True,blank=True)
     lines = models.JSONField(default=list)
@@ -177,6 +186,25 @@ class Bill(Record):
     issued_at = models.DateTimeField(null=True,blank=True)
     class Meta(Record.Meta):
         constraints = [models.CheckConstraint(condition=Q(total__gte=0,settled__gte=0,settled__lte=models.F('total')),name='bill_settlement_bounds')]
+
+class Quotation(Record):
+    franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT)
+    creator = models.ForeignKey(User,on_delete=models.PROTECT)
+    customer = models.ForeignKey(Customer,on_delete=models.PROTECT)
+    kind = models.CharField(max_length=20,choices=[('collection','Collection'),('sale','Sale'),('b2b','B2B')])
+    billing_mode = models.CharField(max_length=16,choices=[('franchise','Franchise Billing'),('company','Company Billing')],default='franchise')
+    number = models.CharField(max_length=32,unique=True)
+    state = models.CharField(max_length=16,choices=[('draft','Draft'),('sent','Sent'),('accepted','Accepted'),('rejected','Rejected'),('converted','Converted')],default='draft')
+    lines = models.JSONField(default=list)
+    subtotal = models.DecimalField(max_digits=16,decimal_places=2,default=0)
+    tax = models.DecimalField(max_digits=16,decimal_places=2,default=0)
+    total = models.DecimalField(max_digits=16,decimal_places=2,default=0)
+    notes = models.CharField(max_length=1000,blank=True)
+    sent_at = models.DateTimeField(null=True,blank=True)
+    accepted_at = models.DateTimeField(null=True,blank=True)
+    rejected_at = models.DateTimeField(null=True,blank=True)
+    converted_at = models.DateTimeField(null=True,blank=True)
+    converted_bill = models.OneToOneField(Bill,null=True,blank=True,on_delete=models.PROTECT,related_name='source_quotation')
 
 class InvoiceSequence(models.Model):
     key = models.CharField(max_length=80,primary_key=True)
@@ -238,6 +266,7 @@ class Receipt(Record):
     actor = models.ForeignKey(User,on_delete=models.PROTECT)
     lines = models.JSONField(default=list)
     note = models.CharField(max_length=1000,blank=True)
+    explanation = models.CharField(max_length=1000,blank=True)
     submitted_at = models.DateTimeField(null=True,blank=True)
     flagged = models.BooleanField(default=False)
     revision = models.PositiveIntegerField(default=1)

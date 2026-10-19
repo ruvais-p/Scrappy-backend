@@ -16,6 +16,8 @@ class PricingFranchise(s.Serializer):
 class PricingCell(s.Serializer):
     franchise=s.UUIDField()
     amount=s.CharField(allow_null=True)
+    discount_percent=s.CharField(allow_null=True)
+    final_price=s.CharField(allow_null=True)
     override=s.BooleanField()
     eligible=s.BooleanField()
 class PricingProduct(s.Serializer):
@@ -24,6 +26,10 @@ class PricingProduct(s.Serializer):
     category_name=s.CharField()
     unit=s.CharField()
     default=s.CharField(allow_null=True)
+    tax_percent=s.CharField()
+    hsn=s.CharField(allow_blank=True)
+    default_final_price=s.CharField(allow_null=True)
+    default_discount_percent=s.CharField(allow_null=True)
     cells=PricingCell(many=True)
 class PricingResponse(s.Serializer):
     franchises=PricingFranchise(many=True)

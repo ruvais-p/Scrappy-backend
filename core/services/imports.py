@@ -76,6 +76,7 @@ def preview(actor,upload):
         if not f: errors.append('Unknown active scrap franchise.')
         driver=User.objects.filter(email=d.get('driver_email'),franchise=f,is_active=True,role__in=[Role.DRIVER,Role.COLLECTOR]).first() if d.get('driver_email') else None
         if d.get('driver_email') and not driver: errors.append('Driver must be active in the specified franchise.')
+        elif driver: errors.append('Do not assign a collector in the import. HQ routes each lead to its franchise admin first.')
         try:
             pickup_date=_parse_date(values[7] if len(values)>7 else d.get('pickup_date',''))
             if pickup_date<timezone.localdate(): raise ValueError()
@@ -113,14 +114,13 @@ def commit(actor,batch):
     if ImportBatch.objects.filter(digest=batch.digest,committed=True).exclude(pk=batch.pk).exists(): raise Conflict('This file has already been imported.')
     for r in batch.rows:
         d=r['data'];f=Franchise.objects.get(pk=d['franchise'],status='active')
-        driver=User.objects.filter(pk=d['driver'],franchise=f,is_active=True,role__in=[Role.DRIVER,Role.COLLECTOR]).first() if d['driver'] else None
-        if d['driver'] and not driver: raise Conflict('Driver eligibility changed. Preview again.')
+        if d['driver']: raise Conflict('Direct collector assignment is no longer supported. Preview the import again without a driver.')
         if datetime.strptime(d['pickup_date'],'%Y-%m-%d').date()<timezone.localdate(): raise Conflict('Pickup date has passed. Preview again.')
         phone=''.join(c for c in d['phone'] if c.isdigit())
         if not 7<=len(phone)<=15: raise ValidationError('Invalid phone.')
         customer,_=Customer.objects.get_or_create(franchise=f,phone=phone,defaults={'name':d['customer_name'],'address':d['address'],'area':d['area']})
-        lead=Lead.objects.create(franchise=f,customer=customer,driver=driver,state='scheduled' if driver else 'unassigned',pickup_date=d['pickup_date'],pickup_time=d['pickup_time'],items=d['items'],upi_id=d['upi_id'],latitude=d['latitude'] or None,longitude=d['longitude'] or None)
-        r['lead']=str(lead.pk);r['status']='created';r['message']='Created and assigned.' if driver else 'Created; waiting for assignment.'
+        lead=Lead.objects.create(franchise=f,customer=customer,state='unassigned',pickup_date=d['pickup_date'],pickup_time=d['pickup_time'],items=d['items'],upi_id=d['upi_id'],latitude=d['latitude'] or None,longitude=d['longitude'] or None)
+        r['lead']=str(lead.pk);r['status']='created';r['message']='Created; waiting for HQ to assign a franchise admin.'
         event(actor,'leads',lead,action='lead.imported')
     batch.committed=True;batch.save(update_fields=['rows','committed','version','updated_at'])
     return batch

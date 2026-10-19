@@ -29,13 +29,29 @@ def ensure_load(actor,lead):
 
 @transaction.atomic
 def assign(actor,lead,data):
-    require(actor,'lead.assign');book_allowed(actor,lead.franchise);version(lead,data.get('version'))
+    require(actor,'lead.assign')
+    if actor.role!=Role.APP: book_allowed(actor,lead.franchise)
+    version(lead,data.get('version'))
     if lead.franchise.status!='active': raise Conflict('This franchise is not accepting new assignments.')
     if lead.started_at or lead.state not in ('unassigned','scheduled'): raise Conflict('Only unstarted leads can be assigned.')
+    if actor.role==Role.HQ:
+        manager=User.objects.filter(pk=data.get('franchise_manager'),is_active=True,
+                                    role=Role.APP,franchise__isnull=False).first()
+        if not manager: raise ValidationError('Choose an active App Franchise Manager.')
+        if lead.load_id: raise Conflict('This lead is already attached to a route and cannot be reassigned.')
+        old_manager=lead.franchise_manager_id;old_driver=lead.driver_id
+        lead.franchise_manager=manager;lead.driver=None;lead.load=None;lead.state='unassigned'
+        lead.version+=1;lead.save(update_fields=['franchise_manager','driver','load','state','version','updated_at'])
+        event(actor,'leads',lead,{'old_franchise_manager':old_manager,'new_franchise_manager':manager.pk,
+                                  'old_driver':old_driver,'new_driver':None},'lead.routed_to_franchise')
+        if old_driver: Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=old_driver,resource_id='')
+        return lead
+    if actor.role!=Role.APP or lead.franchise_manager_id!=actor.pk:
+        raise PermissionDenied('Only the assigned franchise admin can assign a collector to this lead.')
     driver=User.objects.filter(pk=data.get('driver'),is_active=True,franchise=lead.franchise,role__in=[Role.DRIVER,Role.COLLECTOR]).first()
     if not driver: raise ValidationError('Choose an active driver from this franchise.')
     old=lead.driver_id;lead.driver=driver;lead.state='scheduled';lead.version+=1;lead.save()
-    event(actor,'leads',lead,{'old_driver':old,'new_driver':driver.id},'lead.assigned')
+    event(actor,'leads',lead,{'old_driver':old,'new_driver':driver.id,'franchise_manager':actor.pk},'lead.assigned')
     # An old audience reset carries no record or new-owner data.
     if old and old!=driver.id: Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=old,resource_id='')
     return lead

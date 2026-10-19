@@ -9,12 +9,18 @@ def synthetic_records(password=None,policies=False):
     warehouses=[Warehouse.objects.get_or_create(franchise=b,name=b.name+' Warehouse')[0] for b in books[:2]]
     accounts={}
     for role in Role.values:
-        b=None if role in [Role.SUPER,Role.ADMIN,Role.HQ] else books[2] if role in [Role.DIGESTER,Role.STAFF] else books[0]
+        b=None if role in [Role.SUPER,Role.ADMIN,Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.HQ] else books[2] if role in [Role.DIGESTER,Role.STAFF] else books[0]
         email=role+'@example.test';u,created=User.objects.get_or_create(username=email,defaults={'email':email,'role':role,'franchise':b,'warehouse':warehouses[0] if role==Role.WAREHOUSE else None,'first_name':Role(role).label})
+        if password:
+            # Demo accounts are synthetic and must stay aligned with the
+            # documented SCRAPPY_DEMO_PASSWORD when the seeder is rerun.
+            u.set_password(password)
+        elif created:
+            u.set_unusable_password()
         if created:
-            if password:u.set_password(password)
-            else:u.set_unusable_password()
             u.full_clean();u.save()
+        elif password:
+            u.save(update_fields=['password'])
         accounts[role]=u
     for b in books:
         role=Role.COLLECTOR if b.kind=='scrap' else Role.STAFF

@@ -1,8 +1,9 @@
 import json
 from datetime import datetime
 from decimal import Decimal
+from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
-from django.db.models import Count,Sum,Q,Prefetch
+from django.db.models import Case,Count,IntegerField,Sum,Q,Prefetch,When,F
 from django.utils import timezone
 from django.http import HttpResponse
 from rest_framework.views import APIView
@@ -15,15 +16,22 @@ from .serializers import FIELDS,serialize
 from .presentation_schema import DashboardResponse,RegisterResponse,EarningsResponse
 from .auth import identity,issue_token
 from .services.common import command,event,version,decimal,Conflict
-from .services import billing,cash,pickups,warehouse,imports
+from .services import billing,cash,pickups,warehouse,imports,quotations
 
 ALIASES={'movements':'inventory','handovers':'cash'}
 def feature_scope(user,feature,qs=None):
     model=FIELDS[feature][0]
     qs=qs if qs is not None else model.objects.all()
     if feature=='jobs': return qs.filter(actor=user)
-    if feature=='settings': require(user,'settings');return qs
+    if feature=='settings':
+        if has_permission(user,'company.billing.manage'): return qs
+        require(user,'settings');return qs
     if feature=='imports': require(user,'imports');return qs
+    if feature=='leads' and user.role==Role.APP:
+        # HQ routes leads directly to an App Franchise Manager. Their work
+        # queue can span franchises, while every lead remains explicitly
+        # assigned to that manager and collector choices stay franchise-local.
+        return qs.filter(franchise_manager=user)
     qs=scope(user,qs,ALIASES.get(feature,feature))
     if feature=='pickups': qs=qs.filter(lead__isnull=False)
     return qs
@@ -40,6 +48,7 @@ class RegisterView(APIView):
         if feature not in FIELDS: raise NotFound()
         if pk: return Response(serialize(feature,get_object(request.user,feature,pk)))
         qs=feature_scope(request.user,feature)
+        if feature=='leads': qs=qs.select_related('franchise_manager','driver','franchise','customer')
         from .queries import filter_records
         qs,date_field=filter_records(qs,feature,request.query_params)
         fields={f.name for f in qs.model._meta.fields}
@@ -49,6 +58,8 @@ class RegisterView(APIView):
         summary={}
         if feature=='leads':
             summary.update({state:qs.filter(state=state).count() for state in ('unassigned','scheduled','weighing','sent','agreed','closed','not_completed','cancelled')})
+            summary['unassigned']=qs.filter(franchise_manager__isnull=True,driver__isnull=True,state='unassigned').count()
+            summary['assigned_to_app_franchise_manager']=qs.filter(franchise_manager__isnull=False,driver__isnull=True).count()
             paid=Bill.objects.filter(lead__in=qs).exclude(state='draft').aggregate(total=Sum('total'),settled=Sum('settled'))
             summary.update({'billed':str(paid['total'] or 0),'paid':str(paid['settled'] or 0),
                             'outstanding':str((paid['total'] or 0)-(paid['settled'] or 0))})
@@ -73,7 +84,9 @@ class RegisterView(APIView):
                 totals=active.filter(kind__in=kinds).aggregate(total=Sum('total'),settled=Sum('settled'))
                 summary.update({direction+'_'+k:str(v or 0) for k,v in totals.items()})
                 summary[direction+'_outstanding']=str((totals['total'] or 0)-(totals['settled'] or 0))
-        payload={'count':count,'page':page,'page_size':50,'date_basis':date_field,'summary':summary,'results':serialize(feature,qs.order_by('-created_at')[(page-1)*50:page*50] if 'created_at' in fields else qs.order_by('pk')[(page-1)*50:page*50],True)}
+        ordering=Case(When(state='closed',then=1),default=0,output_field=IntegerField()) if feature=='leads' else None
+        ordered=qs.order_by(ordering,'-created_at') if ordering is not None and 'created_at' in fields else qs.order_by('-created_at') if 'created_at' in fields else qs.order_by('pk')
+        payload={'count':count,'page':page,'page_size':50,'date_basis':date_field,'summary':summary,'results':serialize(feature,ordered[(page-1)*50:page*50],True)}
         if request.query_params.get('presentation')=='1':
             from .presentation import enhance_register
             payload=enhance_register(request.user,feature,qs,payload,request.query_params)
@@ -88,7 +101,7 @@ class RegisterPostMixin(APIView):
     def get(self,request,feature,pk):
         if feature not in ('leads','bills','pickups','requirements','receipts','inventory'):
             raise NotFound()
-        if request.user.role not in (Role.ADMIN,Role.COLLECTOR):
+        if request.user.role not in (Role.ADMIN,Role.COLLECTOR,*SEGMENT_NETWORK):
             raise PermissionDenied('Record timelines are limited to local operational roles.')
         obj=get_object(request.user,feature,pk)
         events=AuditEvent.objects.filter(resource=str(obj.pk)).order_by('-created_at')
@@ -104,21 +117,28 @@ class RegisterPostMixin(APIView):
         if feature=='imports':
             if 'file' not in request.FILES: raise ValidationError('Choose a CSV or XLSX file.')
             batch=imports.preview(request.user,request.FILES['file']);return Response(serialize(feature,batch),status=201)
-        action={'franchises':'franchise.create','customers':'customer.create','products':'product.write','categories':'product.write','rates':'rate.write','bills':'bill.write','requirements':'requirement.write'}.get(feature)
+        action={'franchises':'franchise.create','customers':'customer.create','products':'product.write','categories':'product.write','rates':'rate.write','bills':'bill.write','quotations':'quotation.write','requirements':'requirement.write'}.get(feature)
         if not action: raise PermissionDenied()
         require(request.user,action)
         def create(actor):
             require(actor,action)
             if feature=='bills': obj=billing.save_draft(actor,data)
+            elif feature=='quotations': obj=quotations.save(actor,data)
             elif feature=='requirements': obj=warehouse.create_requirement(actor,data)
             elif feature=='rates':
-                product=Product.objects.get(pk=data.get('product'));book=Franchise.objects.get(pk=data['franchise']) if data.get('franchise') else None
+                product=scope(actor,Product.objects.all(),'products').filter(pk=data.get('product')).first()
+                if not product: raise NotFound()
+                book=Franchise.objects.get(pk=data['franchise']) if data.get('franchise') else None
                 if book and not eligible_product(actor,product,book): raise ValidationError('Product is not assigned to this franchise.')
                 if data.get('kind') not in ('collection','b2b','sale'): raise ValidationError('Choose a rate type.')
-                obj=Rate.objects.create(product=product,franchise=book,kind=data['kind'],amount=decimal(data.get('amount')),actor=actor,reason=str(data.get('reason',''))[:500]);event(actor,feature,obj,{'new':str(obj.amount),'reason':obj.reason},'rate.changed')
+                discount=decimal(data.get('discount_percent') or 0,2,positive=False)
+                if discount>100: raise ValidationError('Discount must be between 0 and 100 percent.')
+                if discount and actor.role not in (Role.SUPER,Role.ADMIN,*SEGMENT_NETWORK): raise PermissionDenied('Only Admin and Super Admin can set a discount.')
+                obj=Rate.objects.create(product=product,franchise=book,kind=data['kind'],amount=decimal(data.get('amount')),discount_percent=discount,actor=actor,reason=str(data.get('reason',''))[:500]);event(actor,feature,obj,{'new':str(obj.amount),'discount_percent':str(obj.discount_percent),'reason':obj.reason},'rate.changed')
             else:
-                allowed={'franchises':['name','code','kind','phone','email','address','district','state','gstin','owner_name'], 'customers':['name','phone','address','area','state','gstin'],'categories':['name','kind'],'products':['name','category','unit','tracks_stock','hsn','tax_percent']}[feature]
+                allowed={'franchises':['name','code','kind','phone','email','address','district','state','gstin','owner_name'], 'customers':['name','phone','address','area','state','gstin'],'categories':['name','kind','default_billing_mode'],'products':['name','category','unit','tracks_stock','hsn','tax_percent']}[feature]
                 values={k:data[k] for k in allowed if k in data}
+                if feature=='products' and not values.get('tax_percent'): values['tax_percent']=0
                 if feature=='customers':
                     book=Franchise.objects.get(pk=data.get('franchise') or actor.franchise_id);book_allowed(actor,book)
                     values['franchise']=book;values['phone']=''.join(c for c in str(values.get('phone','')) if c.isdigit())
@@ -136,7 +156,11 @@ class CommandView(APIView):
     def post(self,request,feature,pk,action):
         data=request.data
         get_object(request.user,feature,pk) # replay also requires current scope
-        permission={('leads','assign'):'lead.assign',('leads','reschedule'):'lead.schedule',('leads','cancel'):'lead.schedule',('leads','start'):'pickup.write',('leads','sent'):'pickup.write',('leads','agree'):'pickup.write',('leads','failed'):'pickup.write',('leads','whatsapp-opened'):'pickup.write',('leads','receive'):'receipt.write',('leads','save-reconciliation'):'receipt.write',('loads','unload'):'load.unload',('loads','resolve'):'load.resolve',('handovers','review'):'handover.review',('bills','save'):'bill.write',('bills','issue'):'bill.write',('bills','pay'):'bill.write',('bills','request-cancellation'):'bill.write',('pickups','save'):'pickup.write',('pickups','issue'):'pickup.write',('pickups','pay'):'pickup.write',('requirements','release'):'release.write',('requirements','cancel'):'requirement.write',('imports','commit'):'imports',('franchises','edit'):'franchise.edit',('franchises','suspend'):'franchise.suspend',('customers','edit'):'customer.edit',('products','assign'):'product.assign',('products','edit'):'product.write',('categories','edit'):'product.write'}.get((feature,action))
+        permission={('leads','assign'):'lead.assign',('leads','reschedule'):'lead.schedule',('leads','cancel'):'lead.schedule',('leads','start'):'pickup.write',('leads','sent'):'pickup.write',('leads','agree'):'pickup.write',('leads','failed'):'pickup.write',('leads','whatsapp-opened'):'pickup.write',('leads','receive'):'receipt.write',('leads','save-reconciliation'):'receipt.write',('loads','unload'):'load.unload',('loads','resolve'):'load.resolve',('loads','vehicle-full'):'load.vehicle_full',('receipts','explain'):'receipt.explain',('handovers','review'):'handover.review',('bills','save'):'bill.write',('bills','issue'):'bill.write',('bills','pay'):'bill.write',('bills','request-cancellation'):'bill.write',('pickups','save'):'pickup.write',('pickups','issue'):'pickup.write',('pickups','pay'):'pickup.write',('requirements','release'):'release.write',('requirements','cancel'):'requirement.write',('imports','commit'):'imports',('franchises','edit'):'franchise.edit',('franchises','suspend'):'franchise.suspend',('customers','edit'):'customer.edit',('products','assign'):'product.assign',('products','edit'):'product.write'}.get((feature,action))
+        if feature=='quotations' and action in ('save','send','accept','reject','convert'):
+            permission='bill.write' if action=='convert' else 'quotation.write'
+        if feature=='categories' and action=='edit':
+            permission='company.billing.manage' if 'default_billing_mode' in data else 'product.write'
         if not permission: raise PermissionDenied('This action is not defined.')
         require(request.user,permission)
         def run(actor):
@@ -146,6 +170,10 @@ class CommandView(APIView):
                 if action=='request-cancellation':
                     obj=billing.request_cancellation(actor,obj,data)
                 else: obj=billing.save_draft(actor,data,obj) if action=='save' else billing.issue(actor,obj,data) if action=='issue' else billing.pay(actor,obj,data)
+            elif feature=='quotations':
+                if action=='save': obj=quotations.save(actor,data,obj)
+                elif action=='convert': obj=quotations.convert(actor,obj,data);out='bills'
+                else: obj=quotations.transition(actor,obj,action,data)
             elif feature=='leads':
                 if action=='assign': obj=pickups.assign(actor,obj,data)
                 elif action=='start': obj=pickups.start(actor,obj,data);out='pickups'
@@ -162,6 +190,13 @@ class CommandView(APIView):
                         if obj.pickup_date<timezone.localdate(): raise ValidationError('Date cannot be in the past.')
                     obj.version+=1;obj.save();event(actor,'leads',obj,action='lead.'+action)
                 else: obj=pickups.advance(actor,obj,action,data)
+            elif feature=='loads' and action=='vehicle-full':
+                version(obj,data.get('version'))
+                if obj.driver_id!=actor.pk: raise PermissionDenied('You can only flag your assigned vehicle.')
+                if obj.state!='on_route': raise Conflict('Only an active route can be marked vehicle full.')
+                if obj.vehicle_full_at: raise Conflict('This vehicle has already been marked full.')
+                obj.vehicle_full_at=timezone.now();obj.version+=1;obj.save(update_fields=['vehicle_full_at','version','updated_at'])
+                event(actor,'loads',obj,{'warehouse':str(obj.warehouse_id),'vehicle_full_at':obj.vehicle_full_at.isoformat()},'load.vehicle_full')
             elif feature=='loads' and action=='unload':
                 version(obj,data.get('version'))
                 if actor.role==Role.WAREHOUSE and obj.warehouse_id!=actor.warehouse_id: raise PermissionDenied()
@@ -175,6 +210,18 @@ class CommandView(APIView):
                 event(actor,'loads',obj,{'reference':obj.eligibility_reference},'load.unloaded')
             elif feature=='loads' and action=='resolve':
                 obj=warehouse.resolve_flagged_load(actor,obj,data)
+            elif feature=='receipts' and action=='explain':
+                version(obj,data.get('version'))
+                if actor.role!=Role.WAREHOUSE or obj.warehouse_id!=actor.warehouse_id:
+                    raise PermissionDenied('Only the assigned Warehouse Manager can explain this receipt.')
+                if not obj.flagged or not obj.submitted_at:
+                    raise Conflict('Only a submitted flagged receipt can be explained.')
+                explanation=data.get('explanation')
+                if not isinstance(explanation,str) or not explanation.strip() or len(explanation.strip())>1000:
+                    raise ValidationError('Enter an explanation (1 to 1,000 characters).')
+                obj.explanation=explanation.strip();obj.version+=1
+                obj.save(update_fields=['explanation','version','updated_at'])
+                event(actor,'receipts',obj,{'customer':obj.lead.customer.name,'explanation':obj.explanation},'receipt.explanation_added')
             elif feature=='handovers' and action=='review':
                 obj=cash.review_handover(actor,obj,data)
             elif feature=='requirements':
@@ -192,21 +239,30 @@ class CommandView(APIView):
                 obj.full_clean();obj.version+=1;obj.save();event(actor,feature,obj)
             elif feature in ('products','categories'):
                 version(obj,data.get('version'))
+                old_billing_mode=obj.default_billing_mode if feature=='categories' else None
                 if action=='assign':
                     books=Franchise.objects.filter(pk__in=data.get('franchises',[]))
                     if any(b.kind!=obj.category.kind and b.kind!='hq' for b in books): raise ValidationError('Incompatible franchise type.')
                     obj.franchises.set(books)
                 else:
-                    allowed=('name','unit','tracks_stock','hsn','tax_percent','active') if feature=='products' else ('name','active')
+                    if feature=='categories' and 'default_billing_mode' in data:
+                        require(actor,'company.billing.manage')
+                    allowed=('name','unit','tracks_stock','hsn','tax_percent','active') if feature=='products' else ('name','active','default_billing_mode')
+                    if feature=='categories' and not has_permission(actor,'product.write'):
+                        if set(data)-{'id','version','default_billing_mode'}:
+                            raise PermissionDenied('Category billing settings can only change the default billing mode.')
+                        allowed=('default_billing_mode',)
                     if feature=='categories' and data.get('kind',obj.kind)!=obj.kind:
                         raise ValidationError('Category type cannot change after creation.')
                     for key in allowed:
-                        if key in data: setattr(obj,key,data[key])
+                        if key in data: setattr(obj,key,0 if feature=='products' and key=='tax_percent' and not data[key] else data[key])
                     if feature=='products' and data.get('category'):
                         category=Category.objects.get(pk=data['category'])
                         if obj.franchises.exclude(kind__in=[category.kind,'hq']).exists(): raise ValidationError('Category is incompatible with assigned franchises.')
                         obj.category=category
-                obj.full_clean();obj.version+=1;obj.save();event(actor,feature,obj,action='product.assigned' if action=='assign' else feature+'.updated')
+                obj.full_clean();obj.version+=1;obj.save()
+                details={'previous_billing_mode':old_billing_mode,'billing_mode':obj.default_billing_mode} if feature=='categories' and old_billing_mode!=obj.default_billing_mode else None
+                event(actor,feature,obj,details,action='product.assigned' if action=='assign' else feature+'.updated')
             return serialize(out,obj)
         return Response(command(request.user,request.headers.get('Idempotency-Key'),feature+'.'+action,{'id':str(pk),**data},run))
 
@@ -215,11 +271,13 @@ class TimelineView(APIView):
     def get(self,request,feature,pk):
         if feature not in ('leads','bills','pickups','requirements','receipts','inventory'):
             raise NotFound()
-        if request.user.role not in (Role.ADMIN,Role.COLLECTOR):
+        if request.user.role not in (Role.ADMIN,Role.COLLECTOR,*SEGMENT_NETWORK):
             raise PermissionDenied('Record timelines are limited to local operational roles.')
         obj=get_object(request.user,feature,pk)
         events=AuditEvent.objects.filter(resource=str(obj.pk)).order_by('-created_at')
-        if request.user.role==Role.COLLECTOR:
+        if request.user.role in SEGMENT_NETWORK:
+            events=events.filter(franchise__kind=SEGMENT_NETWORK[request.user.role])
+        elif request.user.role==Role.COLLECTOR:
             lead = getattr(obj,'lead',None) if feature in ('bills','pickups') else None
             allowed=feature=='leads' and getattr(obj,'driver_id',None)==request.user.pk or feature in ('bills','pickups') and (getattr(obj,'creator_id',None)==request.user.pk or (lead and lead.driver_id==request.user.pk))
             if not allowed: raise NotFound()
@@ -277,7 +335,7 @@ class DashboardView(APIView):
                 result['metrics'].append({'label':title+' · outstanding','value':str((tot['total'] or 0)-(tot['paid'] or 0)),'unit':'INR','href':'bills'})
             result['metrics'].append({'label':'Drafts in progress','value':qs.filter(state='draft').count(),'unit':'drafts','href':'bills'})
             result['bills']=serialize('bills',qs[:8],True)
-        if user.role in (Role.SUPER,Role.ADMIN):
+        if user.role in (Role.SUPER,Role.ADMIN,*SEGMENT_NETWORK):
             from .presentation import dashboard_projection
             result.update(dashboard_projection(user))
         return Response(result)
@@ -299,11 +357,18 @@ class OptionsView(APIView):
     def get(self,request):
         user=request.user
         books=Franchise.objects.filter(status='active')
-        if user.role not in NETWORK: books=books.filter(pk=user.franchise_id)
+        if user.role in SEGMENT_NETWORK: books=books.filter(kind=SEGMENT_NETWORK[user.role])
+        elif user.role not in NETWORK: books=books.filter(pk=user.franchise_id)
         if user.role in (Role.COLLECTOR,Role.WAREHOUSE): books=books.filter(pk=user.franchise_id)
         book_ids=set(books.values_list('pk',flat=True))
         products=Product.objects.filter(active=True,category__active=True,franchises__in=books).distinct().prefetch_related('franchises')
         staff=User.objects.filter(pk__in=feature_scope(user,'bills').values('creator_id')) if has_permission(user,'bills') else User.objects.none()
+        franchise_managers=User.objects.filter(role=Role.APP,is_active=True,franchise__in=books).select_related('franchise').order_by('first_name','last_name','pk')
+        if user.role==Role.APP: franchise_managers=franchise_managers.filter(pk=user.pk)
+        driver_books=books
+        if user.role==Role.APP:
+            driver_books=Franchise.objects.filter(
+                pk__in=Lead.objects.filter(franchise_manager=user).values('franchise_id'),status='active')
         # Selecting eligible items does not grant catalogue maintenance.
         from .cache import cached_read
         minimum_version = request.headers.get('X-Minimum-Version')
@@ -311,15 +376,18 @@ class OptionsView(APIView):
             minimum_version = int(minimum_version) if minimum_version is not None else None
         except (TypeError, ValueError):
             minimum_version = None
-        return Response(cached_read(user,'options',{'presentation':3},lambda:{'franchises':[{'id':str(b.pk),'name':b.name,'kind':b.kind} for b in books],'products':[{'id':str(p.pk),'name':p.name,'unit':p.unit,'franchises':[str(b.pk) for b in p.franchises.all() if b.pk in book_ids]} for p in products],'categories':[{'id':str(c.pk),'name':c.name} for c in (Category.objects.filter(active=True) if has_permission(user,'products') else Category.objects.filter(active=True,pk__in=products.values('category_id')))],'staff':[{'id':str(d.pk),'name':d.get_full_name() or d.email} for d in staff],'drivers':[{'id':str(d.pk),'name':d.get_full_name() or d.email,'franchise':str(d.franchise_id)} for d in User.objects.filter(franchise__in=books,role__in=[Role.DRIVER,Role.COLLECTOR],is_active=True)] if has_permission(user,'lead.assign') or has_permission(user,'team') else [],'warehouses':[{'id':str(w.pk),'name':w.name,'franchise':str(w.franchise_id)} for w in Warehouse.objects.filter(franchise__in=books)] if has_permission(user,'team') else []},minimum_version=minimum_version))
+        categories=Category.objects.filter(active=True)
+        if user.role in SEGMENT_NETWORK: categories=categories.filter(kind=SEGMENT_NETWORK[user.role])
+        elif not has_permission(user,'products'): categories=categories.filter(pk__in=products.values('category_id'))
+        return Response(cached_read(user,'options',{'presentation':8},lambda:{'franchises':[{'id':str(b.pk),'name':b.name,'kind':b.kind} for b in books],'products':[{'id':str(p.pk),'name':p.name,'unit':p.unit,'category':str(p.category_id),'billing_mode':p.category.default_billing_mode,'franchises':[str(b.pk) for b in p.franchises.all() if b.pk in book_ids]} for p in products],'categories':[{'id':str(c.pk),'name':c.name,'kind':c.kind,'default_billing_mode':c.default_billing_mode} for c in categories],'staff':[{'id':str(d.pk),'name':d.get_full_name() or d.email} for d in staff],'drivers':[{'id':str(d.pk),'name':d.get_full_name() or d.email,'franchise':str(d.franchise_id)} for d in User.objects.filter(franchise__in=driver_books,role__in=[Role.DRIVER,Role.COLLECTOR],is_active=True)] if has_permission(user,'lead.assign') or has_permission(user,'team') else [],'franchise_managers':[{'id':str(manager.pk),'name':manager.get_full_name() or manager.email,'franchise':str(manager.franchise_id),'franchise_name':manager.franchise.name} for manager in franchise_managers] if has_permission(user,'lead.assign') else [],'warehouses':[{'id':str(w.pk),'name':w.name,'franchise':str(w.franchise_id)} for w in Warehouse.objects.filter(franchise__in=books)] if has_permission(user,'team') else [],'billing_access':billing.billing_access(user)},minimum_version=minimum_version))
 
 class SettingsView(APIView):
     @extend_schema(request=dict,responses=dict)
     def post(self,request,section):
-        require(request.user,'settings')
-        if section not in ('company','invoice','gst','payment_methods'): raise NotFound()
+        require(request.user,'company.billing.manage' if section=='billing_permissions' else 'settings')
+        if section not in ('company','invoice','gst','payment_methods','billing_permissions'): raise NotFound()
         def run(actor):
-            require(actor,'settings')
+            require(actor,'company.billing.manage' if section=='billing_permissions' else 'settings')
             # UI settings cannot approve unresolved business-policy gates.
             obj,_=CompanySetting.objects.get_or_create(section=section)
             version(obj,request.data.get('version',1));old=obj.values
@@ -333,6 +401,13 @@ class SettingsView(APIView):
                 if isinstance(methods,str): methods=[m.strip() for m in methods.split(',') if m.strip()]
                 if not isinstance(methods,list) or any(m not in ('Cash','UPI','Bank transfer','Card','Cheque') for m in methods): raise ValidationError('Choose supported payment methods.')
                 values={**values,'methods':methods}
+            if section=='billing_permissions':
+                from .services.billing import DEFAULT_BILLING_ACCESS
+                roles=values.get('roles')
+                valid_modes={'purchase','sales'};valid_types={'B2B','B2C','B2G'}
+                if not isinstance(roles,dict) or any(role not in DEFAULT_BILLING_ACCESS for role in roles): raise ValidationError('Choose valid billing roles.')
+                for role,access in roles.items():
+                    if not isinstance(access,dict) or not isinstance(access.get('modes'),list) or not isinstance(access.get('types'),list) or set(access['modes'])-valid_modes or set(access['types'])-valid_types: raise ValidationError('Choose valid transaction modes and types.')
             obj.values=values;obj.version+=1;obj.save();event(actor,'settings',obj,{'old':old,'new':obj.values})
             return serialize('settings',obj)
         return Response(command(request.user,request.headers.get('Idempotency-Key'),'settings.'+section,request.data,run))
@@ -342,11 +417,14 @@ class TeamView(APIView):
         if user.role==Role.APP: return [Role.DRIVER,Role.COLLECTOR]
         if user.role==Role.DIGESTER: return [Role.STAFF]
         if user.role==Role.HQ: return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE]
-        return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE,Role.DIGESTER,Role.STAFF]
+        if user.role==Role.APP_MANAGER: return [Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE]
+        if user.role==Role.DIGESTER_MANAGER: return [Role.DIGESTER,Role.STAFF]
+        return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE,Role.DIGESTER,Role.STAFF,Role.APP_MANAGER,Role.DIGESTER_MANAGER]
     @extend_schema(responses=dict)
     def get(self,request):
         require(request.user,'team');qs=User.objects.filter(role__in=self.targets(request.user))
-        if request.user.role not in NETWORK: qs=qs.filter(franchise=request.user.franchise)
+        if request.user.role in SEGMENT_NETWORK: qs=qs.filter(franchise__kind=SEGMENT_NETWORK[request.user.role])
+        elif request.user.role not in NETWORK: qs=qs.filter(franchise=request.user.franchise)
         search=request.query_params.get('search','')[:160]
         if search: qs=qs.filter(Q(first_name__icontains=search)|Q(email__icontains=search))
         if request.query_params.get('role'):
@@ -364,7 +442,7 @@ class TeamView(APIView):
             if request.query_params['active'] not in ('true','false'): raise ValidationError('Invalid active filter.')
             qs=qs.filter(is_active=request.query_params['active']=='true')
         targets=self.targets(request.user)
-        roles=[{'id':role,'name':name,'permissions':[key for key,roleset in GRANTS.items() if role in roleset]} for role,name in Role.choices]
+        roles=[{'id':role,'name':name,'permissions':sorted(role_permissions(role))} for role,name in Role.choices]
         roles.extend({'id':'custom:'+str(r.id),'name':r.name,'base_role':r.base_role,'permissions':r.permissions} for r in RoleDefinition.objects.filter(base_role__in=targets).order_by('name'))
         return Response({'results':[{**identity(u),'is_active':u.is_active,'last_login':u.last_login,'can_edit':True} for u in qs.select_related('franchise','custom_role')], 'targets':targets, 'roles':roles})
     @extend_schema(request=dict,responses=dict)
@@ -376,7 +454,20 @@ class TeamView(APIView):
             if data.get('id'):
                 target=User.objects.select_for_update().filter(pk=data['id'],role__in=self.targets(actor)).first()
                 if not target: raise NotFound()
-                book_allowed(actor,target.franchise)
+                if target.role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER):
+                    if actor.role not in (Role.SUPER,Role.ADMIN): raise NotFound()
+                else: book_allowed(actor,target.franchise)
+            if data.get('action')=='set_password':
+                if not target: raise ValidationError('Choose a user account.')
+                password=str(data.get('password',''))
+                validate_password(password,target)
+                target.set_password(password)
+                target.permission_version+=1
+                target.save(update_fields=['password','permission_version'])
+                AuditEvent.objects.create(actor=actor,franchise_id=target.franchise_id,
+                                          action='account.password_admin_changed',resource=str(target.pk))
+                Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=target.id,resource_id='')
+                return {'detail':'Password changed successfully.'}
             selection=data.get('role',('custom:'+str(target.custom_role_id) if target and target.custom_role_id else target.role) if target else '')
             custom_role=None
             if isinstance(selection,str) and selection.startswith('custom:'):
@@ -386,9 +477,17 @@ class TeamView(APIView):
             else: role=selection
             if role not in self.targets(actor) or (custom_role and custom_role.base_role not in self.targets(actor)):
                 raise PermissionDenied('This target role is not delegated.')
-            book=Franchise.objects.get(pk=data.get('franchise') or (target.franchise_id if target else actor.franchise_id));book_allowed(actor,book)
-            if book.status!='active': raise ValidationError('Choose an active franchise.')
-            if target and target.franchise_id!=book.id and Lead.objects.filter(driver=target).exclude(state__in=['closed','not_completed','cancelled']).exists(): raise Conflict('Resolve active assignments before moving this account.')
+            network_role=role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER)
+            if network_role:
+                if actor.role not in (Role.SUPER,Role.ADMIN): raise PermissionDenied('Only Admin and Super Admin can manage network tracking roles.')
+                if data.get('franchise'): raise ValidationError('Network tracking roles cannot be assigned to one franchise.')
+                book=None
+            else:
+                book_id=data.get('franchise') or (target.franchise_id if target else actor.franchise_id)
+                if not book_id: raise ValidationError('Choose a franchise for this account.')
+                book=Franchise.objects.get(pk=book_id);book_allowed(actor,book)
+                if book.status!='active': raise ValidationError('Choose an active franchise.')
+                if target and target.franchise_id!=book.id and Lead.objects.filter(driver=target).exclude(state__in=['closed','not_completed','cancelled']).exists(): raise Conflict('Resolve active assignments before moving this account.')
             email=str(data.get('email',target.email if target else '')).strip().lower()
             if not target: target=User(username=email,email=email);target.set_unusable_password()
             target.email=email;target.username=email;target.first_name=str(data.get('name',target.first_name))[:150];target.role=role;target.custom_role=custom_role;target.franchise=book
@@ -397,6 +496,11 @@ class TeamView(APIView):
             if data.get('action')=='disable': target.is_active=False
             elif data.get('action')=='enable': target.is_active=True
             target.permission_version+=1;target.full_clean();target.save()
+            # Options (including lead assignment choices) are cached against
+            # this revision. User role, active status, and franchise changes
+            # must immediately invalidate those choices.
+            DataRevision.objects.get_or_create(key='global')
+            DataRevision.objects.filter(key='global').update(value=F('value')+1)
             AuditEvent.objects.create(actor=actor,franchise=book,action='team.updated',resource=str(target.pk),details={'role':role,'active':target.is_active})
             Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=target.id,resource_id='')
             # Invitation delivery is queued after transaction, with durable job record.
@@ -409,8 +513,9 @@ class RoleDefinitionsView(APIView):
         require(request.user,'role.write')
         targets=TeamView().targets(request.user)
         roles=[{'id':role,'name':name} for role,name in Role.choices if role in targets]
-        permissions={role:[key for key,roleset in GRANTS.items() if role in roleset and key!='role.write'] for role in targets}
-        results=[{'id':str(r.id),'name':r.name,'base_role':r.base_role,'permissions':r.permissions,'version':r.version,'users':r.users.count()} for r in RoleDefinition.objects.order_by('name')]
+        permissions={role:sorted(role_permissions(role)-{'role.write'}) for role in targets}
+        role_qs=RoleDefinition.objects.filter(base_role__in=targets) if request.user.role in SEGMENT_NETWORK else RoleDefinition.objects.all()
+        results=[{'id':str(r.id),'name':r.name,'base_role':r.base_role,'permissions':r.permissions,'version':r.version,'users':r.users.count()} for r in role_qs.order_by('name')]
         return Response({'base_roles':roles,'permissions':permissions,'results':results})
 
     def post(self,request):
@@ -423,7 +528,7 @@ class RoleDefinitionsView(APIView):
         if not name or len(name)>80: raise ValidationError('Role name is required and must be at most 80 characters.')
         if base_role not in targets: raise ValidationError('Choose a role scope you are allowed to manage.')
         if not isinstance(permissions,list) or len(permissions)>len(GRANTS): raise ValidationError('Choose valid permissions.')
-        allowed={key for key,roleset in GRANTS.items() if base_role in roleset and key!='role.write'}
+        allowed=role_permissions(base_role)-{'role.write'}
         if any(not isinstance(permission,str) or permission not in allowed for permission in permissions):
             raise ValidationError('A permission is not available for the selected role scope.')
         permissions=sorted(set(permissions))
@@ -531,6 +636,8 @@ class PayoutView(APIView):
         qs=EarningsEntry.objects.select_related('franchise','bill').order_by('-created_at')
         if request.user.role==Role.DIGESTER:
             qs=qs.filter(franchise_id=request.user.franchise_id)
+        elif request.user.role in SEGMENT_NETWORK:
+            qs=scope(request.user,qs,'earnings')
         elif request.user.role not in NETWORK:
             raise PermissionDenied('Earnings statements are limited to digester managers and head office.')
         selected=request.query_params.get('franchise')
@@ -538,7 +645,7 @@ class PayoutView(APIView):
             qs=qs.filter(franchise_id=selected)
         total=qs.aggregate(total=Sum('amount'))['total'] or Decimal(0)
         from .presentation import earnings_projection
-        return Response({'balance':str(total),'can_payout':request.user.role in (Role.SUPER,Role.ADMIN),'results':serialize('earnings',qs[:200],True),**earnings_projection(request.user,qs,selected)})
+        return Response({'balance':str(total),'can_payout':request.user.role in (Role.SUPER,Role.ADMIN,Role.DIGESTER_MANAGER),'results':serialize('earnings',qs[:200],True),**earnings_projection(request.user,qs,selected)})
 
     @extend_schema(request=dict,responses=dict)
     def post(self,request):
@@ -547,6 +654,7 @@ class PayoutView(APIView):
             require(actor,'payout.write');policy('digester_earnings')
             book=Franchise.objects.select_for_update().filter(pk=request.data.get('franchise'),kind='digester').first()
             if not book: raise NotFound()
+            book_allowed(actor,book)
             available=EarningsEntry.objects.filter(franchise=book).aggregate(total=Sum('amount'))['total'] or Decimal(0)
             amount=decimal(request.data.get('amount'))
             if amount>available: raise Conflict('Payout exceeds available earnings.')

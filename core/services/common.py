@@ -26,7 +26,8 @@ def event(actor,feature,obj,details=None,action=None):
     franchise_id=getattr(obj,'franchise_id',None)
     if franchise_id is None and hasattr(obj,'warehouse'): franchise_id=obj.warehouse.franchise_id
     AuditEvent.objects.create(actor=actor,franchise_id=franchise_id,action=action or feature,resource=str(obj.pk),details=details or {})
-    Outbox.objects.create(actor=actor,franchise_id=franchise_id,feature=feature,resource_id=str(obj.pk),owner_id=getattr(obj,'creator_id',getattr(obj,'driver_id',None)),warehouse_id=getattr(obj,'warehouse_id',None))
+    owner_id=getattr(obj,'creator_id',None) or getattr(obj,'driver_id',None) or getattr(obj,'franchise_manager_id',None)
+    Outbox.objects.create(actor=actor,franchise_id=franchise_id,feature=feature,resource_id=str(obj.pk),owner_id=owner_id,warehouse_id=getattr(obj,'warehouse_id',None))
 
 def command(actor,key,action,payload,fn):
     if not key or len(key)>100: raise ValidationError('An Idempotency-Key of at most 100 characters is required.')

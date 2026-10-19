@@ -1,5 +1,5 @@
 """Scoped, additive read projections for the authenticated workspace."""
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
 from django.db.models import Sum, Count, Max, Q
 from django.utils import timezone
@@ -57,19 +57,37 @@ def enhance_register(user,feature,qs,payload,params):
                 from .views import TeamView
                 row['staff_count']=User.objects.filter(franchise_id=row['id'],is_active=True,role__in=TeamView().targets(user)).count() if has_permission(user,'team') else None
     if feature=='products':
-        defaults={}
+        defaults={};selected_book=params.get('franchise')
+        if selected_book:
+            visible_book=scope(user,Franchise.objects.filter(pk=selected_book),'franchises').first()
+            selected_book=str(visible_book.pk) if visible_book else None
         for rate in Rate.objects.filter(franchise__isnull=True,product_id__in=[r['id'] for r in rows]).order_by('-created_at','-id'):
-            defaults.setdefault((str(rate.product_id),rate.kind),str(rate.amount))
+            defaults.setdefault((str(rate.product_id),rate.kind),rate)
+        overrides={}
+        if selected_book:
+            for rate in Rate.objects.filter(franchise_id=selected_book,product_id__in=[r['id'] for r in rows]).order_by('-created_at','-id'):
+                overrides.setdefault((str(rate.product_id),rate.kind),rate)
         for row in rows:
-            row['default_price']=defaults.get((str(row['id']),'collection' if row.get('category_kind')=='scrap' else 'sale'))
+            rate_kind='collection' if row.get('category_kind')=='scrap' else 'sale'
+            rate=overrides.get((str(row['id']),rate_kind)) or defaults.get((str(row['id']),rate_kind))
+            if rate:
+                row['final_price']=str(final_unit_price(rate.amount,rate.discount_percent,Decimal(str(row.get('tax_percent') or 0))))
+                row['default_discount_percent']=str(rate.discount_percent)
+            else:
+                row['final_price']=None;row['default_discount_percent']=None
     return payload
+
+
+def final_unit_price(amount,discount_percent,tax_percent):
+    discounted=(Decimal(amount)*(Decimal('1')-Decimal(discount_percent)/Decimal('100'))).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
+    return (discounted*(Decimal('1')+Decimal(tax_percent)/Decimal('100'))).quantize(Decimal('.01'),rounding=ROUND_HALF_UP)
 
 
 def dashboard_projection(user):
     qs=active_bills(user);today=timezone.localdate();month=today.replace(day=1)
     books=scope(user,Franchise.objects.all(),'franchises').order_by('name')
     rows=[]
-    earnings=EarningsEntry.objects.all() if user.role in (Role.SUPER,Role.ADMIN) else EarningsEntry.objects.none()
+    earnings=scope(user,EarningsEntry.objects.all(),'earnings') if has_permission(user,'earnings') else EarningsEntry.objects.none()
     for book in books:
         b=qs.filter(franchise=book);period=b.filter(issued_at__date__gte=month,issued_at__date__lte=today)
         rows.append({'id':str(book.pk),'name':book.name,'kind':book.kind,'today':str(totals(b.filter(issued_at__date=today))['total']),'month':str(totals(period)['total']),'count':period.count(),'receivable':str(totals(b.filter(kind='sale'))['outstanding']),'payable':str(totals(b.exclude(kind='sale'))['outstanding']),'share_owed':str(earnings.filter(franchise=book).aggregate(v=Sum('amount'))['v'] or 0) if book.kind=='digester' else None})
@@ -111,20 +129,32 @@ class SearchView(APIView):
 class PricingView(APIView):
     @extend_schema(responses=PricingResponse)
     def get(self,request):
-        user=request.user;require(user,'rates');kind=request.query_params.get('kind','collection')
+        user=request.user;can_manage_rates=has_permission(user,'rates')
+        if not can_manage_rates and not (has_permission(user,'bill.write') or has_permission(user,'pickup.write')):
+            require(user,'rates')
+        kind=request.query_params.get('kind','collection')
         if kind not in ('collection','b2b','sale'): raise ValidationError('Invalid rate type.')
-        books=scope(user,Franchise.objects.all(),'franchises').order_by('name')
+        if can_manage_rates:
+            books=scope(user,Franchise.objects.all(),'franchises')
+            rate_rows=scope(user,Rate.objects.filter(kind=kind),'rates')
+        elif user.role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER):
+            books=Franchise.objects.filter(kind='scrap' if user.role==Role.APP_MANAGER else 'digester',status='active')
+            rate_rows=Rate.objects.filter(kind=kind,product__franchises__in=books).filter(Q(franchise__in=books)|Q(franchise__isnull=True))
+        else:
+            books=Franchise.objects.filter(pk=user.franchise_id,status='active')
+            rate_rows=Rate.objects.filter(kind=kind,product__franchises__in=books).filter(Q(franchise__in=books)|Q(franchise__isnull=True))
+        books=books.order_by('name')
         products=Product.objects.filter(active=True,category__active=True,franchises__in=books).distinct().select_related('category').prefetch_related('franchises')
         if request.query_params.get('category'): products=products.filter(category_id=request.query_params['category'])
         rates={}
-        for rate in scope(user,Rate.objects.filter(kind=kind),'rates').order_by('-created_at','-id'):
-            rates.setdefault((str(rate.product_id),str(rate.franchise_id) if rate.franchise_id else ''),str(rate.amount))
+        for rate in rate_rows.order_by('-created_at','-id'):
+            rates.setdefault((str(rate.product_id),str(rate.franchise_id) if rate.franchise_id else ''),rate)
         rows=[]
         for product in products.order_by('name'):
             default=rates.get((str(product.pk),''));assigned={b.pk for b in product.franchises.all()}
             cells=[]
             for book in books:
-                override=rates.get((str(product.pk),str(book.pk)));eligible=book.pk in assigned
-                cells.append({'franchise':str(book.pk),'amount':(override or default) if eligible else None,'override':bool(override) and eligible,'eligible':eligible})
-            rows.append({'id':str(product.pk),'name':product.name,'category_name':product.category.name,'unit':product.unit,'default':default,'cells':cells})
+                override=rates.get((str(product.pk),str(book.pk)));eligible=book.pk in assigned;rate=override or default
+                cells.append({'franchise':str(book.pk),'amount':str(rate.amount) if rate and eligible else None,'discount_percent':str(rate.discount_percent) if rate and eligible else None,'final_price':str(final_unit_price(rate.amount,rate.discount_percent,product.tax_percent)) if rate and eligible else None,'override':bool(override) and eligible,'eligible':eligible})
+            rows.append({'id':str(product.pk),'name':product.name,'category_name':product.category.name,'unit':product.unit,'default':str(default.amount) if default else None,'tax_percent':str(product.tax_percent),'hsn':product.hsn,'default_final_price':str(final_unit_price(default.amount,default.discount_percent,product.tax_percent)) if default else None,'default_discount_percent':str(default.discount_percent) if default else None,'cells':cells})
         return Response({'franchises':[{'id':str(b.pk),'name':b.name,'kind':b.kind} for b in books],'results':rows})
