@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 from django.core.exceptions import ImproperlyConfigured
 BASE_DIR = Path(__file__).resolve().parent.parent
 from dotenv import load_dotenv
@@ -14,8 +15,22 @@ INSTALLED_APPS = ['django.contrib.auth','django.contrib.contenttypes','django.co
 MIDDLEWARE = ['django.middleware.security.SecurityMiddleware','django.contrib.sessions.middleware.SessionMiddleware','django.middleware.common.CommonMiddleware','django.middleware.csrf.CsrfViewMiddleware','django.contrib.auth.middleware.AuthenticationMiddleware','core.middleware.AccessMiddleware']
 ROOT_URLCONF = 'config.urls'
 ASGI_APPLICATION = 'config.asgi.application'
-DATABASES = {'default': {'ENGINE':'django.db.backends.postgresql','NAME':os.getenv('POSTGRES_DB','scrappy'),'USER':os.getenv('POSTGRES_USER','scrappy'),'PASSWORD':os.environ.get('POSTGRES_PASSWORD',''),'HOST':os.getenv('POSTGRES_HOST','127.0.0.1'),'PORT':os.getenv('POSTGRES_PORT','55432'),'CONN_MAX_AGE':0}}
-DATABASES['default']['OPTIONS'] = {'sslmode':os.getenv('POSTGRES_SSLMODE','prefer')}
+database_url=os.getenv('DATABASE_URL')
+if database_url:
+    parsed_database_url=urlparse(database_url)
+    if parsed_database_url.scheme not in ('postgres','postgresql') or not parsed_database_url.hostname:
+        raise ImproperlyConfigured('DATABASE_URL must be a valid PostgreSQL URL.')
+    database_query=parse_qs(parsed_database_url.query)
+    DATABASES={'default':{'ENGINE':'django.db.backends.postgresql',
+        'NAME':unquote(parsed_database_url.path.lstrip('/')),
+        'USER':unquote(parsed_database_url.username or ''),
+        'PASSWORD':unquote(parsed_database_url.password or ''),
+        'HOST':parsed_database_url.hostname,
+        'PORT':str(parsed_database_url.port or 5432),
+        'CONN_MAX_AGE':0,
+        'OPTIONS':{'sslmode':database_query.get('sslmode',[os.getenv('POSTGRES_SSLMODE','prefer')])[0]}}}
+else:
+    DATABASES={'default':{'ENGINE':'django.db.backends.postgresql','NAME':os.getenv('POSTGRES_DB','scrappy'),'USER':os.getenv('POSTGRES_USER','scrappy'),'PASSWORD':os.environ.get('POSTGRES_PASSWORD',''),'HOST':os.getenv('POSTGRES_HOST','127.0.0.1'),'PORT':os.getenv('POSTGRES_PORT','55432'),'CONN_MAX_AGE':0,'OPTIONS':{'sslmode':os.getenv('POSTGRES_SSLMODE','prefer')}}}
 AUTH_USER_MODEL = 'core.User'
 AUTHENTICATION_BACKENDS = ['django.contrib.auth.backends.ModelBackend']
 PASSWORD_HASHERS = ['django.contrib.auth.hashers.Argon2PasswordHasher','django.contrib.auth.hashers.PBKDF2PasswordHasher']
