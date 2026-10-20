@@ -96,6 +96,35 @@ class RegisterView(APIView):
     def post(self,request,feature,pk=None):
         return RegisterPostMixin.post(self,request,feature,pk)
 
+class WarehouseView(APIView):
+    def get(self,request):
+        require(request.user,'warehouses')
+        rows=Warehouse.objects.select_related('franchise').order_by('franchise__name','name')
+        return Response({'results':[{'id':str(w.pk),'name':w.name,'franchise':str(w.franchise_id),'franchise_name':w.franchise.name,'version':w.version} for w in rows]})
+
+    def post(self,request):
+        require(request.user,'warehouses');data=request.data
+        def run(actor):
+            require(actor,'warehouses')
+            if data.get('id'):
+                try: obj=Warehouse.objects.select_for_update().select_related('franchise').get(pk=data['id'])
+                except (Warehouse.DoesNotExist,ValueError): raise NotFound()
+                version(obj,data.get('version'))
+                name=data.get('name')
+                if not isinstance(name,str) or not name.strip() or len(name.strip())>160: raise ValidationError({'name':'Enter a name up to 160 characters.'})
+                obj.name=name.strip();obj.version+=1;obj.save(update_fields=['name','version','updated_at'])
+                event(actor,'warehouses',obj,action='warehouse.updated')
+            else:
+                name=data.get('name');book_id=data.get('franchise')
+                if not isinstance(name,str) or not name.strip() or len(name.strip())>160: raise ValidationError({'name':'Enter a name up to 160 characters.'})
+                try: book=Franchise.objects.get(pk=book_id,status='active')
+                except (Franchise.DoesNotExist,ValueError,TypeError): raise ValidationError({'franchise':'Choose an active franchise.'})
+                book_allowed(actor,book)
+                obj=Warehouse.objects.create(name=name.strip(),franchise=book)
+                event(actor,'warehouses',obj,action='warehouse.created')
+            return {'id':str(obj.pk),'name':obj.name,'franchise':str(obj.franchise_id),'franchise_name':obj.franchise.name,'version':obj.version}
+        return Response(command(request.user,request.headers.get('Idempotency-Key'),'warehouse.write',data,run))
+
 class RegisterPostMixin(APIView):
     @extend_schema(responses=dict)
     def get(self,request,feature,pk):
@@ -356,6 +385,12 @@ class OptionsView(APIView):
     @extend_schema(responses=dict)
     def get(self,request):
         user=request.user
+        if user.role in (Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO):
+            from .digester_views import lsgd_payload
+            lsgds=lsgd_scope(user,LSGD.objects.select_related('district','assigned_manager','assigned_tso'))
+            managers=User.objects.filter(role=Role.ZONAL_MANAGER,is_active=True).order_by('first_name','last_name','pk') if user.role==Role.DIGESTER_MANAGER else User.objects.none()
+            tsos=digester_team_scope(user,User.objects.select_related('manager')) if user.role in (Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER) else User.objects.none()
+            return Response({'franchises':[],'products':[],'categories':[],'staff':[],'drivers':[],'franchise_managers':[],'warehouses':[],'billing_access':{},'lsgds':[lsgd_payload(row) for row in lsgds.order_by('district__name','name')[:500]],'zonal_managers':[{'id':str(row.pk),'name':row.get_full_name() or row.email} for row in managers],'tsos':[{'id':str(row.pk),'name':row.get_full_name() or row.email,'manager':str(row.manager_id)} for row in tsos]})
         books=Franchise.objects.filter(status='active')
         if user.role in SEGMENT_NETWORK: books=books.filter(kind=SEGMENT_NETWORK[user.role])
         elif user.role not in NETWORK: books=books.filter(pk=user.franchise_id)
@@ -415,15 +450,16 @@ class SettingsView(APIView):
 class TeamView(APIView):
     def targets(self,user):
         if user.role==Role.APP: return [Role.DRIVER,Role.COLLECTOR]
-        if user.role==Role.DIGESTER: return [Role.STAFF]
+        if user.role==Role.DIGESTER_MANAGER: return [Role.ZONAL_MANAGER,Role.TSO]
+        if user.role==Role.ZONAL_MANAGER: return [Role.TSO]
         if user.role==Role.HQ: return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE]
         if user.role==Role.APP_MANAGER: return [Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE]
-        if user.role==Role.DIGESTER_MANAGER: return [Role.DIGESTER,Role.STAFF]
-        return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE,Role.DIGESTER,Role.STAFF,Role.APP_MANAGER,Role.DIGESTER_MANAGER]
+        return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE,Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO]
     @extend_schema(responses=dict)
     def get(self,request):
         require(request.user,'team');qs=User.objects.filter(role__in=self.targets(request.user))
-        if request.user.role in SEGMENT_NETWORK: qs=qs.filter(franchise__kind=SEGMENT_NETWORK[request.user.role])
+        if request.user.role in (Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER): qs=digester_team_scope(request.user,qs)
+        elif request.user.role in SEGMENT_NETWORK: qs=qs.filter(franchise__kind=SEGMENT_NETWORK[request.user.role])
         elif request.user.role not in NETWORK: qs=qs.filter(franchise=request.user.franchise)
         search=request.query_params.get('search','')[:160]
         if search: qs=qs.filter(Q(first_name__icontains=search)|Q(email__icontains=search))
@@ -442,7 +478,7 @@ class TeamView(APIView):
             if request.query_params['active'] not in ('true','false'): raise ValidationError('Invalid active filter.')
             qs=qs.filter(is_active=request.query_params['active']=='true')
         targets=self.targets(request.user)
-        roles=[{'id':role,'name':name,'permissions':sorted(role_permissions(role))} for role,name in Role.choices]
+        roles=[{'id':role,'name':name,'permissions':sorted(role_permissions(role))} for role,name in Role.choices if role in targets]
         roles.extend({'id':'custom:'+str(r.id),'name':r.name,'base_role':r.base_role,'permissions':r.permissions} for r in RoleDefinition.objects.filter(base_role__in=targets).order_by('name'))
         return Response({'results':[{**identity(u),'is_active':u.is_active,'last_login':u.last_login,'can_edit':True} for u in qs.select_related('franchise','custom_role')], 'targets':targets, 'roles':roles})
     @extend_schema(request=dict,responses=dict)
@@ -452,11 +488,13 @@ class TeamView(APIView):
             require(actor,'team')
             target=None
             if data.get('id'):
-                target=User.objects.select_for_update().filter(pk=data['id'],role__in=self.targets(actor)).first()
+                target_qs=User.objects.select_for_update().filter(pk=data['id'],role__in=self.targets(actor))
+                if actor.role in (Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER): target_qs=digester_team_scope(actor,target_qs)
+                target=target_qs.first()
                 if not target: raise NotFound()
-                if target.role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER):
-                    if actor.role not in (Role.SUPER,Role.ADMIN): raise NotFound()
-                else: book_allowed(actor,target.franchise)
+            if target.role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER):
+                if actor.role not in (Role.SUPER,Role.ADMIN): raise NotFound()
+            elif target.role not in (Role.ZONAL_MANAGER,Role.TSO): book_allowed(actor,target.franchise)
             if data.get('action')=='set_password':
                 if not target: raise ValidationError('Choose a user account.')
                 password=str(data.get('password',''))
@@ -477,9 +515,10 @@ class TeamView(APIView):
             else: role=selection
             if role not in self.targets(actor) or (custom_role and custom_role.base_role not in self.targets(actor)):
                 raise PermissionDenied('This target role is not delegated.')
-            network_role=role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER)
+            network_role=role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO)
             if network_role:
-                if actor.role not in (Role.SUPER,Role.ADMIN): raise PermissionDenied('Only Admin and Super Admin can manage network tracking roles.')
+                allowed_actor=(actor.role in (Role.SUPER,Role.ADMIN) or actor.role==Role.DIGESTER_MANAGER and role in (Role.ZONAL_MANAGER,Role.TSO) or actor.role==Role.ZONAL_MANAGER and role==Role.TSO)
+                if not allowed_actor: raise PermissionDenied('This role cannot manage that field-sales account.')
                 if data.get('franchise'): raise ValidationError('Network tracking roles cannot be assigned to one franchise.')
                 book=None
             else:
@@ -491,6 +530,16 @@ class TeamView(APIView):
             email=str(data.get('email',target.email if target else '')).strip().lower()
             if not target: target=User(username=email,email=email);target.set_unusable_password()
             target.email=email;target.username=email;target.first_name=str(data.get('name',target.first_name))[:150];target.role=role;target.custom_role=custom_role;target.franchise=book
+            if role==Role.TSO:
+                manager_id=data.get('manager')
+                if actor.role==Role.ZONAL_MANAGER: manager_id=actor.pk
+                if not manager_id and target.manager_id: manager_id=target.manager_id
+                manager=User.objects.filter(pk=manager_id,role=Role.ZONAL_MANAGER,is_active=True).first()
+                if not manager: raise ValidationError({'manager':'Choose an active Zonal Manager.'})
+                if actor.role==Role.ZONAL_MANAGER and manager.pk!=actor.pk: raise PermissionDenied()
+                target.manager=manager
+            else:
+                target.manager=None
             target.warehouse=Warehouse.objects.get(pk=data['warehouse']) if data.get('warehouse') else target.warehouse
             if role!=Role.WAREHOUSE: target.warehouse=None
             if data.get('action')=='disable': target.is_active=False

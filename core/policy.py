@@ -3,16 +3,26 @@ from django.db.models import Q
 from rest_framework.exceptions import PermissionDenied, NotFound, APIException
 from .models import Role, Policy, HandoverRoute, Rate
 NETWORK = {Role.SUPER, Role.ADMIN, Role.HQ}
-SEGMENT_NETWORK = {Role.APP_MANAGER: 'scrap', Role.DIGESTER_MANAGER: 'digester'}
+SEGMENT_NETWORK = {Role.APP_MANAGER: 'scrap'}
 OWN = {Role.DRIVER,Role.STAFF,Role.COLLECTOR}
 BILLING = {Role.SUPER,Role.ADMIN,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF}
-TRACKING = {Role.APP_MANAGER, Role.DIGESTER_MANAGER}
+TRACKING = {Role.APP_MANAGER}
 GRANTS = {
  'dashboard':set(Role.values), 'franchises':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF},
+ 'lsgds':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'opportunities':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'visit_plans':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'visits':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'followups':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'field_days':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'claims':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'expense_items':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+ 'settlements':{Role.DIGESTER_MANAGER},
  'customers':BILLING|TRACKING, 'bills':BILLING|TRACKING, 'quotations':BILLING|TRACKING, 'payments':BILLING|TRACKING|{Role.COLLECTOR}, 'earnings':{Role.SUPER,Role.ADMIN,Role.DIGESTER},
  'products':{Role.SUPER,Role.ADMIN}, 'categories':{Role.SUPER,Role.ADMIN},
  'rates':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER}, 'audit':{Role.SUPER,Role.HQ}, 'settings':{Role.SUPER},
- 'team':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER},
+ 'team':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER,Role.ZONAL_MANAGER},
+ 'warehouses':{Role.SUPER,Role.ADMIN,Role.HQ},
  'leads':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE},
  'pickups':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.COLLECTOR},
  'loads':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE},
@@ -25,6 +35,11 @@ GRANTS = {
  'company.billing.manage':{Role.SUPER,Role.ADMIN},
  'franchise.create':{Role.SUPER,Role.HQ}, 'franchise.edit':{Role.SUPER,Role.HQ},'franchise.suspend':{Role.SUPER},
  'customer.create':BILLING, 'customer.edit':{Role.SUPER,Role.ADMIN,Role.APP,Role.DIGESTER},
+'lsgd.create':{Role.DIGESTER_MANAGER},'lsgd.assign.manager':{Role.DIGESTER_MANAGER},'lsgd.assign.tso':{Role.ZONAL_MANAGER},
+'opportunity.write':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},'lsgd.contact.write':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+'visit.plan':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER},'visit.write':{Role.ZONAL_MANAGER,Role.TSO},
+'visit.review':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER},'followup.write':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
+'claim.write':{Role.ZONAL_MANAGER,Role.TSO},'claim.review':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER},'claim.pay':{Role.DIGESTER_MANAGER},'expense.policy.write':{Role.DIGESTER_MANAGER},
 'product.write':{Role.SUPER},'product.assign':{Role.SUPER},'rate.write':{Role.SUPER,Role.ADMIN,Role.HQ},
 'lead.assign':{Role.HQ,Role.APP},'lead.schedule':{Role.HQ,Role.APP},'pickup.write':{Role.DRIVER,Role.COLLECTOR},
  'bill.write':BILLING, 'quotation.write':BILLING, 'receipt.write':{Role.WAREHOUSE,Role.HQ},'requirement.write':{Role.HQ},'release.write':{Role.APP,Role.HQ},
@@ -64,6 +79,25 @@ class PolicyUnavailable(APIException):
 def require(user, action):
     if not user.is_authenticated or not user.is_active or not has_permission(user,action):
         raise PermissionDenied('This action is not available for your role.')
+
+def lsgd_scope(user, qs):
+    require(user, 'lsgds')
+    prefix='' if qs.model.__name__=='LSGD' else 'lsgd__'
+    if user.role == Role.DIGESTER_MANAGER:
+        return qs
+    if user.role == Role.ZONAL_MANAGER:
+        return qs.filter(**{prefix+'assigned_manager_id':user.pk})
+    if user.role == Role.TSO:
+        return qs.filter(**{prefix+'assigned_tso_id':user.pk})
+    return qs.none()
+
+def digester_team_scope(user, qs):
+    require(user, 'team')
+    if user.role == Role.DIGESTER_MANAGER:
+        return qs.filter(role__in=[Role.ZONAL_MANAGER, Role.TSO])
+    if user.role == Role.ZONAL_MANAGER:
+        return qs.filter(role=Role.TSO, manager_id=user.pk)
+    return qs.none()
 
 def policy(key):
     p=Policy.objects.filter(key=key).first()

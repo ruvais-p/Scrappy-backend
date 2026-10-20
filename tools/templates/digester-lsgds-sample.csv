@@ -1,0 +1,5 @@
+name,kind,district,address,latitude,longitude
+CSV Demo Grama Panchayat,grama_panchayat,Kozhikode,"Synthetic sample row for Digester LSGD import",11.2580000,75.7800000
+CSV Demo Block Panchayat,block_panchayat,Kannur,"Synthetic sample row for Digester LSGD import",11.8740000,75.3700000
+CSV Demo Municipality,municipality,Kottayam,"Synthetic sample row for Digester LSGD import",9.5916000,76.5222000
+CSV Demo District Panchayat,district_panchayat,Palakkad,"Synthetic sample row for Digester LSGD import",10.7867000,76.6548000

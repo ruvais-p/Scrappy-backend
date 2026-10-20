@@ -9,8 +9,19 @@ def synthetic_records(password=None,policies=False):
     warehouses=[Warehouse.objects.get_or_create(franchise=b,name=b.name+' Warehouse')[0] for b in books[:2]]
     accounts={}
     for role in Role.values:
-        b=None if role in [Role.SUPER,Role.ADMIN,Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.HQ] else books[2] if role in [Role.DIGESTER,Role.STAFF] else books[0]
-        email=role+'@example.test';u,created=User.objects.get_or_create(username=email,defaults={'email':email,'role':role,'franchise':b,'warehouse':warehouses[0] if role==Role.WAREHOUSE else None,'first_name':Role(role).label})
+        if role in [Role.DIGESTER,Role.STAFF]: continue
+        b=None if role in [Role.SUPER,Role.ADMIN,Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO,Role.HQ] else books[0]
+        manager=accounts.get(Role.ZONAL_MANAGER) if role==Role.TSO else None
+        email='digester_manager@example.test' if role==Role.DIGESTER_MANAGER else role+'@example.test'
+        if role==Role.DIGESTER_MANAGER:
+            u=User.objects.filter(role=role,email=email).first() or User.objects.filter(role=role,email='digester_hq_manager@example.test').first()
+            created=u is None
+            if created:
+                u=User(username=email,email=email,role=role,franchise=b,manager=manager,warehouse=None,first_name=Role(role).label)
+            elif u.email!=email and not User.objects.filter(username=email).exclude(pk=u.pk).exists():
+                u.email=email;u.username=email
+        else:
+            u,created=User.objects.get_or_create(username=email,defaults={'email':email,'role':role,'franchise':b,'manager':manager,'warehouse':warehouses[0] if role==Role.WAREHOUSE else None,'first_name':Role(role).label})
         if password:
             # Demo accounts are synthetic and must stay aligned with the
             # documented SCRAPPY_DEMO_PASSWORD when the seeder is rerun.
@@ -19,11 +30,12 @@ def synthetic_records(password=None,policies=False):
             u.set_unusable_password()
         if created:
             u.full_clean();u.save()
-        elif password:
-            u.save(update_fields=['password'])
+        elif password or (role==Role.DIGESTER_MANAGER and u.email==email):
+            u.save(update_fields=['password','email','username'] if password else ['email','username'])
         accounts[role]=u
     for b in books:
-        role=Role.COLLECTOR if b.kind=='scrap' else Role.STAFF
+        if b.kind!='scrap': continue
+        role=Role.COLLECTOR
         email=b.code.lower()+'-staff@example.test'
         u,created=User.objects.get_or_create(username=email,defaults={'email':email,'role':role,'franchise':b,'first_name':b.name+' Staff'})
         if created:u.set_unusable_password();u.save()

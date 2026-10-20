@@ -1,4 +1,5 @@
 import uuid
+from django.conf import settings
 from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -8,12 +9,14 @@ class Role(models.TextChoices):
     SUPER = 'super_admin', 'Super Admin'
     ADMIN = 'admin', 'Admin'
     APP_MANAGER = 'app_manager', 'App Manager'
-    DIGESTER_MANAGER = 'digester_manager', 'Digester Manager'
+    DIGESTER_MANAGER = 'digester_hq_manager', 'Digester HQ Manager'
+    ZONAL_MANAGER = 'zonal_manager', 'Zonal Manager'
+    TSO = 'tso', 'Territory Sales Officer'
     HQ = 'hq_manager', 'HQ Manager'
     APP = 'app_franchise_manager', 'App Franchise Manager'
     DRIVER = 'delivery_staff', 'Delivery Staff'
-    DIGESTER = 'digester_franchise_admin', 'Digester Franchise Admin'
-    STAFF = 'digester_staff', 'Digester Staff'
+    DIGESTER = 'digester_franchise_admin', 'Legacy Digester Franchise Admin'
+    STAFF = 'digester_staff', 'Legacy Digester Staff'
     WAREHOUSE = 'warehouse_manager', 'Warehouse Manager'
     COLLECTOR = 'collector', 'Collector'
 
@@ -29,6 +32,7 @@ class Record(models.Model):
 class RoleDefinition(Record):
     name = models.CharField(max_length=80, unique=True)
     base_role = models.CharField(max_length=30, choices=Role.choices)
+    legacy_base_role = models.CharField(max_length=30, blank=True)
     permissions = models.JSONField(default=list)
     created_by = models.ForeignKey('User', null=True, blank=True, on_delete=models.SET_NULL, related_name='created_role_definitions')
 
@@ -58,6 +62,9 @@ class User(AbstractUser):
     role = models.CharField(max_length=30,choices=Role.choices)
     custom_role = models.ForeignKey(RoleDefinition,null=True,blank=True,on_delete=models.SET_NULL,related_name='users')
     franchise = models.ForeignKey(Franchise,null=True,blank=True,on_delete=models.PROTECT)
+    legacy_franchise = models.ForeignKey(Franchise,null=True,blank=True,on_delete=models.PROTECT,related_name='legacy_digester_accounts')
+    legacy_digester_role = models.CharField(max_length=32,blank=True)
+    manager = models.ForeignKey('self',null=True,blank=True,on_delete=models.PROTECT,related_name='reporting_staff')
     warehouse = models.ForeignKey(Warehouse,null=True,blank=True,on_delete=models.PROTECT)
     permission_version = models.PositiveIntegerField(default=1)
     vehicle = models.CharField(max_length=80,blank=True)
@@ -67,18 +74,193 @@ class User(AbstractUser):
     mfa_last_step = models.BigIntegerField(default=-1)
     recovery_hashes = models.JSONField(default=list,blank=True)
     class Meta:
-        constraints = [models.CheckConstraint(condition=(Q(role__in=['super_admin','admin','hq_manager','app_manager','digester_manager'],franchise__isnull=True,warehouse__isnull=True)|Q(role__in=['app_franchise_manager','delivery_staff','digester_franchise_admin','digester_staff','collector'],franchise__isnull=False,warehouse__isnull=True)|Q(role='warehouse_manager',franchise__isnull=False,warehouse__isnull=False)),name='role_scope_required')]
+        constraints = [models.CheckConstraint(condition=(Q(role__in=['super_admin','admin','hq_manager','app_manager','digester_hq_manager','zonal_manager','tso'],franchise__isnull=True,warehouse__isnull=True)|Q(role__in=['app_franchise_manager','delivery_staff','digester_franchise_admin','digester_staff','collector'],franchise__isnull=False,warehouse__isnull=True)|Q(role='warehouse_manager',franchise__isnull=False,warehouse__isnull=False)),name='role_scope_required')]
     def clean(self):
         super().clean()
         if self.custom_role_id and self.custom_role.base_role != self.role:
             raise ValidationError('The assigned custom role must use the account role scope.')
-        if self.role in [Role.SUPER,Role.ADMIN,Role.HQ,Role.APP_MANAGER,Role.DIGESTER_MANAGER]:
+        if self.role in [Role.SUPER,Role.ADMIN,Role.HQ,Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO]:
             if self.franchise_id or self.warehouse_id: raise ValidationError('Network accounts must not have a fixed franchise.')
+            if self.role == Role.TSO and (not self.manager_id or self.manager.role != Role.ZONAL_MANAGER): raise ValidationError('A TSO must report to a Zonal Manager.')
+            if self.role != Role.TSO and self.manager_id: raise ValidationError('Only TSOs may have a reporting manager.')
         else:
             if not self.franchise_id: raise ValidationError('A franchise is required.')
             expected = 'digester' if self.role in [Role.DIGESTER,Role.STAFF] else 'scrap'
             if self.franchise.kind != expected: raise ValidationError('Role and franchise type are incompatible.')
             if self.role == Role.WAREHOUSE and (not self.warehouse_id or self.warehouse.franchise_id != self.franchise_id): raise ValidationError('A warehouse in the assigned franchise is required.')
+
+class District(Record):
+    name = models.CharField(max_length=80, unique=True)
+
+    def __str__(self): return self.name
+
+class LSGD(Record):
+    TYPES = [('grama_panchayat','Grama Panchayat'),('block_panchayat','Block Panchayat'),('district_panchayat','District Panchayat'),('municipality','Municipality'),('corporation','Corporation')]
+    name = models.CharField(max_length=180)
+    kind = models.CharField(max_length=24, choices=TYPES)
+    district = models.ForeignKey(District,on_delete=models.PROTECT,related_name='lsgds')
+    latitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    longitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    assigned_manager = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='managed_lsgds')
+    assigned_tso = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='assigned_lsgds')
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='created_lsgds')
+    manager_assigned_by = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='assigned_lsgd_managers')
+    tso_assigned_by = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='assigned_lsgd_tso')
+    active = models.BooleanField(default=True)
+    address = models.TextField(blank=True)
+    class Meta(Record.Meta):
+        constraints = [models.UniqueConstraint(fields=['name','district'],name='lsgd_name_per_district')]
+
+class LSGDContact(Record):
+    lsgd = models.ForeignKey(LSGD,on_delete=models.PROTECT,related_name='contacts')
+    name = models.CharField(max_length=160)
+    designation = models.CharField(max_length=120,blank=True)
+    phone = models.CharField(max_length=24,blank=True)
+    email = models.EmailField(blank=True)
+    decision_maker = models.BooleanField(default=False)
+    verified_by = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='verified_lsgd_contacts')
+
+class LSGDOpportunity(Record):
+    STAGES = [('new','New'),('first_meeting','First meeting'),('demo_done','Demo done'),('proposal_submitted','Proposal submitted'),('in_annual_plan','In annual plan'),('dpc_approved','DPC approved'),('work_order','Work order'),('supplied','Supplied'),('payment_received','Payment received'),('lost','Lost')]
+    lsgd = models.ForeignKey(LSGD,on_delete=models.PROTECT,related_name='opportunities')
+    financial_year = models.CharField(max_length=9)
+    stage = models.CharField(max_length=24,choices=STAGES,default='new')
+    expected_units = models.PositiveIntegerField(default=0)
+    expected_value = models.DecimalField(max_digits=14,decimal_places=2,default=0)
+    chance_percent = models.PositiveSmallIntegerField(default=10)
+    expected_month = models.DateField(null=True,blank=True)
+    lost_reason = models.CharField(max_length=500,blank=True)
+    updated_by = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT)
+    class Meta(Record.Meta):
+        constraints = [models.UniqueConstraint(fields=['lsgd','financial_year'],name='one_lsgd_opportunity_per_fy'),models.CheckConstraint(condition=Q(chance_percent__gte=0,chance_percent__lte=100),name='opportunity_chance_range')]
+
+class VisitPlan(Record):
+    lsgd = models.ForeignKey(LSGD,on_delete=models.PROTECT,related_name='visit_plans')
+    assigned_to = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='visit_plans')
+    planned_date = models.DateField()
+    purpose = models.CharField(max_length=500,blank=True)
+    state = models.CharField(max_length=16,choices=[('planned','Planned'),('done','Done'),('cancelled','Cancelled')],default='planned')
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='created_visit_plans')
+
+class FieldVisit(Record):
+    lsgd = models.ForeignKey(LSGD,on_delete=models.PROTECT,related_name='visits')
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='field_visits')
+    plan = models.ForeignKey(VisitPlan,null=True,blank=True,on_delete=models.PROTECT,related_name='visits')
+    visited_at = models.DateTimeField()
+    latitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    longitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    gps_accuracy = models.DecimalField(max_digits=8,decimal_places=2,null=True,blank=True)
+    distance_m = models.PositiveIntegerField(null=True,blank=True)
+    photo_path = models.CharField(max_length=500,blank=True)
+    photo_captured_at = models.DateTimeField(null=True,blank=True)
+    discussion = models.TextField(blank=True)
+    outcome = models.TextField(blank=True)
+    interest = models.PositiveSmallIntegerField(null=True,blank=True)
+    flags = models.JSONField(default=list)
+    details_at = models.DateTimeField(null=True,blank=True)
+    zm_status = models.CharField(max_length=16,choices=[('pending','Pending'),('verified','Verified'),('flagged','Flagged'),('rejected','Rejected')],default='pending')
+    zm_reviewer = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='reviewed_field_visits')
+    zm_remark = models.TextField(blank=True)
+    ho_remark = models.TextField(blank=True)
+    ho_signed_at = models.DateTimeField(null=True,blank=True)
+    ho_reviewer = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='signed_field_visits')
+
+class VisitContact(Record):
+    visit = models.ForeignKey(FieldVisit,on_delete=models.PROTECT,related_name='people_met')
+    contact = models.ForeignKey(LSGDContact,on_delete=models.PROTECT)
+
+class FieldFollowUp(Record):
+    MODES = [('visit','Visit'),('call','Call'),('whatsapp','WhatsApp'),('email','Email')]
+    lsgd = models.ForeignKey(LSGD,on_delete=models.PROTECT,related_name='followups')
+    visit = models.ForeignKey(FieldVisit,null=True,blank=True,on_delete=models.PROTECT,related_name='followups')
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='field_followups')
+    contact = models.ForeignKey(LSGDContact,null=True,blank=True,on_delete=models.PROTECT)
+    due_date = models.DateField()
+    mode = models.CharField(max_length=12,choices=MODES)
+    note = models.TextField()
+    completed_at = models.DateTimeField(null=True,blank=True)
+    completion_note = models.TextField(blank=True)
+
+class FieldDay(Record):
+    MODES = [('two_wheeler','Two wheeler'),('car','Car'),('public_transport','Public transport')]
+    STATUSES = [('open','Open'),('submitted','Submitted'),('zm_approved','Verified by ZM'),('ho_approved','Approved by HQ'),('rejected','Rejected'),('paid','Paid')]
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='expense_days')
+    day = models.DateField()
+    status = models.CharField(max_length=16,choices=STATUSES,default='open')
+    travel_mode = models.CharField(max_length=20,choices=MODES)
+    vehicle_number = models.CharField(max_length=40,blank=True)
+    start_odometer = models.PositiveIntegerField(null=True,blank=True)
+    end_odometer = models.PositiveIntegerField(null=True,blank=True)
+    start_photo_path = models.CharField(max_length=500,blank=True)
+    end_photo_path = models.CharField(max_length=500,blank=True)
+    start_latitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    start_longitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    end_latitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    end_longitude = models.DecimalField(max_digits=10,decimal_places=7,null=True,blank=True)
+    started_at = models.DateTimeField()
+    ended_at = models.DateTimeField(null=True,blank=True)
+    night_halt = models.BooleanField(default=False)
+    halt_place = models.CharField(max_length=180,blank=True)
+    note = models.TextField(blank=True)
+    da_requested = models.DecimalField(max_digits=12,decimal_places=2,default=0)
+    ta_km = models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    gps_km = models.DecimalField(max_digits=10,decimal_places=2,null=True,blank=True)
+    ta_amount = models.DecimalField(max_digits=12,decimal_places=2,default=0)
+    total_claimed = models.DecimalField(max_digits=12,decimal_places=2,default=0)
+    approved_amount = models.DecimalField(max_digits=12,decimal_places=2,null=True,blank=True)
+    flags = models.JSONField(default=list)
+    submitted_at = models.DateTimeField(null=True,blank=True)
+    reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='reviewed_expense_days')
+    review_note = models.TextField(blank=True)
+    ho_approved_by = models.ForeignKey(settings.AUTH_USER_MODEL,null=True,blank=True,on_delete=models.PROTECT,related_name='approved_expense_days')
+    ho_note = models.TextField(blank=True)
+    paid_at = models.DateTimeField(null=True,blank=True)
+    class Meta(Record.Meta):
+        constraints = [models.UniqueConstraint(fields=['owner','day'],name='one_field_day_per_owner_date')]
+
+class ExpenseItem(Record):
+    CATEGORIES = [('da_bill','DA bill'),('bus_train','Bus or train'),('auto_taxi','Auto or taxi'),('parking_toll','Parking or toll'),('lodging','Lodging'),('phone_internet','Phone or internet'),('printing_courier','Printing or courier'),('other','Other')]
+    field_day = models.ForeignKey(FieldDay,on_delete=models.PROTECT,related_name='items')
+    category = models.CharField(max_length=24,choices=CATEGORIES)
+    amount = models.DecimalField(max_digits=12,decimal_places=2,default=0)
+    description = models.CharField(max_length=500,blank=True)
+    bill_number = models.CharField(max_length=100,blank=True)
+    photo_path = models.CharField(max_length=500)
+    photo_digest = models.CharField(max_length=64)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT)
+
+class ExpensePayment(Record):
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='expense_payments')
+    month = models.CharField(max_length=7)
+    amount = models.DecimalField(max_digits=14,decimal_places=2)
+    reference = models.CharField(max_length=120)
+    note = models.TextField(blank=True)
+    paid_by = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='issued_expense_payments')
+    paid_at = models.DateTimeField()
+    class Meta(Record.Meta):
+        constraints = [models.UniqueConstraint(fields=['owner','month'],name='one_expense_payment_per_owner_month')]
+
+class ClaimEvent(Record):
+    field_day = models.ForeignKey(FieldDay,on_delete=models.PROTECT,related_name='events')
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT)
+    action = models.CharField(max_length=32)
+    old_status = models.CharField(max_length=16,blank=True)
+    new_status = models.CharField(max_length=16,blank=True)
+    amount = models.DecimalField(max_digits=12,decimal_places=2,null=True,blank=True)
+    note = models.TextField(blank=True)
+
+class ExpensePolicy(Record):
+    two_wheeler_rate = models.DecimalField(max_digits=8,decimal_places=2,default=0)
+    car_rate = models.DecimalField(max_digits=8,decimal_places=2,default=0)
+    da_local_max = models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    da_night_max = models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    da_bill_threshold = models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    lodging_cap = models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    auto_taxi_cap = models.DecimalField(max_digits=10,decimal_places=2,default=0)
+    daily_km_limit = models.PositiveIntegerField(default=0)
+    gps_allowance_percent = models.PositiveSmallIntegerField(default=0)
+    road_factor = models.DecimalField(max_digits=5,decimal_places=2,default='1.35')
+    submit_days = models.PositiveSmallIntegerField(default=0)
 
 class Customer(Record):
     franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT)

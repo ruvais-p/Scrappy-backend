@@ -21,7 +21,8 @@ from .policy import GRANTS,effective_permissions
 
 def identity(user):
     custom=getattr(user,'custom_role',None) if getattr(user,'custom_role_id',None) else None
-    return {'id':user.id,'name':user.get_full_name() or user.email,'email':user.email,'role':user.role,'role_label':custom.name if custom else user.get_role_display(),'access_role':'custom:'+str(custom.id) if custom else user.role,'custom_role':str(custom.id) if custom else None,'franchise':str(user.franchise_id) if user.franchise_id else None,'franchise_name':user.franchise.name if user.franchise_id else 'All franchises','warehouse':str(user.warehouse_id) if user.warehouse_id else None,'permission_version':user.permission_version,'capabilities':sorted(effective_permissions(user))}
+    is_digester_field=user.role in (Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO)
+    return {'id':user.id,'name':user.get_full_name() or user.email,'email':user.email,'role':user.role,'role_label':custom.name if custom else user.get_role_display(),'access_role':'custom:'+str(custom.id) if custom else user.role,'custom_role':str(custom.id) if custom else None,'franchise':str(user.franchise_id) if user.franchise_id else None,'franchise_name':'Digester field network' if is_digester_field else user.franchise.name if user.franchise_id else 'All franchises','manager':str(user.manager_id) if user.manager_id else None,'manager_name':(user.manager.get_full_name() or user.manager.email) if user.manager_id else None,'warehouse':str(user.warehouse_id) if user.warehouse_id else None,'permission_version':user.permission_version,'capabilities':sorted(effective_permissions(user))}
 
 def throttle(key,limit=5):
     digest=hashlib.sha256(key.encode()).hexdigest()
