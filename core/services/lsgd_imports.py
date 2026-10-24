@@ -83,14 +83,22 @@ def preview(actor, upload):
             errors.append('Enter a valid Kerala coordinate pair or leave both coordinates blank.')
 
         key = (data['district'].casefold(), data['name'].casefold())
-        if key in seen:
-            errors.append('Duplicate LSGD in this file.')
+        duplicate_in_file = key in seen
         seen.add(key)
-        if data['name'] and data['district'] and LSGD.objects.filter(
+        duplicate_in_db = bool(data['name'] and data['district'] and LSGD.objects.filter(
             name__iexact=data['name'], district__name__iexact=data['district']
-        ).exists():
-            errors.append('An LSGD with this name already exists in the district.')
-        rows.append({'row': number, 'data': data, 'errors': errors, 'lsgd': None})
+        ).exists())
+        if not errors and (duplicate_in_file or duplicate_in_db):
+            reason = 'Duplicate in this file; skipped.' if duplicate_in_file else 'Already exists; skipped.'
+            rows.append({'row': number, 'data': data, 'errors': [], 'lsgd': None, 'status': 'skipped', 'message': reason})
+        else:
+            rows.append({
+                'row': number,
+                'data': data,
+                'errors': errors,
+                'lsgd': None,
+                **({'status': 'skipped', 'message': 'Invalid row; skipped.'} if errors else {}),
+            })
 
     return ImportBatch.objects.create(
         actor=actor,
@@ -117,9 +125,6 @@ def commit(actor, batch_id):
         raise NotFound()
     if batch.committed:
         return payload(batch)
-    if any(row.get('errors') for row in batch.rows):
-        raise ValidationError('Correct all invalid rows before importing.')
-
     with connection.cursor() as cursor:
         cursor.execute('SELECT pg_advisory_xact_lock(%s)', [int(batch.digest[:16], 16) % (2**63)])
     if ImportBatch.objects.filter(digest=batch.digest, committed=True).exclude(pk=batch.pk).exists():
@@ -128,17 +133,38 @@ def commit(actor, batch_id):
     try:
         with transaction.atomic():
             for row in batch.rows:
+                if row.get('errors') or row.get('status') == 'skipped':
+                    continue
                 values = row['data']
                 district, _ = District.objects.get_or_create(name=values['district'])
-                lsgd = LSGD.objects.create(
-                    name=values['name'],
-                    kind=values['kind'],
-                    district=district,
-                    address=values['address'],
-                    latitude=Decimal(values['latitude']) if values['latitude'] else None,
-                    longitude=Decimal(values['longitude']) if values['longitude'] else None,
-                    created_by=actor,
-                )
+                # A different CSV may have created the same LSGD after preview.
+                # Serialize same-key imports and recheck before inserting so the
+                # existing record and its assignments are never overwritten.
+                key = f"{district.pk}:{values['name'].casefold()}"
+                lock_id = int(hashlib.sha256(key.encode()).hexdigest()[:16], 16) % (2**63)
+                with connection.cursor() as cursor:
+                    cursor.execute('SELECT pg_advisory_xact_lock(%s)', [lock_id])
+                existing = LSGD.objects.filter(name__iexact=values['name'], district=district).first()
+                if existing:
+                    row['status'] = 'skipped'
+                    row['message'] = 'Already exists; skipped.'
+                    continue
+                try:
+                    with transaction.atomic():
+                        lsgd = LSGD.objects.create(
+                            name=values['name'], kind=values['kind'], district=district,
+                            address=values['address'],
+                            latitude=Decimal(values['latitude']) if values['latitude'] else None,
+                            longitude=Decimal(values['longitude']) if values['longitude'] else None,
+                            created_by=actor,
+                        )
+                except IntegrityError:
+                    existing = LSGD.objects.filter(name__iexact=values['name'], district=district).first()
+                    if not existing:
+                        raise
+                    row['status'] = 'skipped'
+                    row['message'] = 'Already exists; skipped.'
+                    continue
                 row['lsgd'] = str(lsgd.pk)
                 row['status'] = 'created'
                 row['message'] = 'Created; assign this LSGD to a Zonal Manager.'

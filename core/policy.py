@@ -5,10 +5,14 @@ from .models import Role, Policy, HandoverRoute, Rate
 NETWORK = {Role.SUPER, Role.ADMIN, Role.HQ}
 SEGMENT_NETWORK = {Role.APP_MANAGER: 'scrap'}
 OWN = {Role.DRIVER,Role.STAFF,Role.COLLECTOR}
-BILLING = {Role.SUPER,Role.ADMIN,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF}
-TRACKING = {Role.APP_MANAGER}
+# General Billing workspace is reserved for Admin and Super Admin. Assigned
+# pickup billing remains a separate operational permission on leads/pickups.
+BILLING = {Role.SUPER,Role.ADMIN}
 GRANTS = {
  'dashboard':set(Role.values), 'franchises':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.DIGESTER,Role.STAFF},
+ 'kwd_leads':{Role.DIGESTER_MANAGER,Role.DIGESTER}, 'kwd_sales':{Role.DIGESTER},
+ 'kwd_stock':{Role.DIGESTER}, 'kwd_targets':{Role.DIGESTER_MANAGER,Role.DIGESTER},
+ 'kwd_presentations':{Role.DIGESTER},
  'lsgds':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
  'opportunities':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
  'visit_plans':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
@@ -18,10 +22,10 @@ GRANTS = {
  'claims':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
  'expense_items':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
  'settlements':{Role.DIGESTER_MANAGER},
- 'customers':BILLING|TRACKING, 'bills':BILLING|TRACKING, 'quotations':BILLING|TRACKING, 'payments':BILLING|TRACKING|{Role.COLLECTOR}, 'earnings':{Role.SUPER,Role.ADMIN,Role.DIGESTER},
+ 'customers':BILLING|{Role.DIGESTER}, 'bills':BILLING|{Role.DIGESTER}, 'quotations':BILLING, 'payments':BILLING, 'earnings':BILLING,
  'products':{Role.SUPER,Role.ADMIN}, 'categories':{Role.SUPER,Role.ADMIN},
  'rates':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER}, 'audit':{Role.SUPER,Role.HQ}, 'settings':{Role.SUPER},
- 'team':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER,Role.ZONAL_MANAGER},
+ 'team':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DIGESTER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER},
  'warehouses':{Role.SUPER,Role.ADMIN,Role.HQ},
  'leads':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE},
  'pickups':{Role.SUPER,Role.ADMIN,Role.HQ,Role.APP,Role.DRIVER,Role.COLLECTOR},
@@ -34,7 +38,7 @@ GRANTS = {
  'company.billing':BILLING,
  'company.billing.manage':{Role.SUPER,Role.ADMIN},
  'franchise.create':{Role.SUPER,Role.HQ}, 'franchise.edit':{Role.SUPER,Role.HQ},'franchise.suspend':{Role.SUPER},
- 'customer.create':BILLING, 'customer.edit':{Role.SUPER,Role.ADMIN,Role.APP,Role.DIGESTER},
+ 'customer.create':BILLING|{Role.DIGESTER}, 'customer.edit':BILLING,
 'lsgd.create':{Role.DIGESTER_MANAGER},'lsgd.assign.manager':{Role.DIGESTER_MANAGER},'lsgd.assign.tso':{Role.ZONAL_MANAGER},
 'opportunity.write':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},'lsgd.contact.write':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO},
 'visit.plan':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER},'visit.write':{Role.ZONAL_MANAGER,Role.TSO},
@@ -42,19 +46,24 @@ GRANTS = {
 'claim.write':{Role.ZONAL_MANAGER,Role.TSO},'claim.review':{Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER},'claim.pay':{Role.DIGESTER_MANAGER},'expense.policy.write':{Role.DIGESTER_MANAGER},
 'product.write':{Role.SUPER},'product.assign':{Role.SUPER},'rate.write':{Role.SUPER,Role.ADMIN,Role.HQ},
 'lead.assign':{Role.HQ,Role.APP},'lead.schedule':{Role.HQ,Role.APP},'pickup.write':{Role.DRIVER,Role.COLLECTOR},
- 'bill.write':BILLING, 'quotation.write':BILLING, 'receipt.write':{Role.WAREHOUSE,Role.HQ},'requirement.write':{Role.HQ},'release.write':{Role.APP,Role.HQ},
+ 'bill.write':BILLING|{Role.DIGESTER}, 'quotation.write':BILLING, 'receipt.write':{Role.WAREHOUSE,Role.HQ},'requirement.write':{Role.HQ},'release.write':{Role.APP,Role.HQ},
  'float.write':{Role.HQ,Role.WAREHOUSE}, 'count.write':{Role.HQ,Role.WAREHOUSE},'handover.review':{Role.APP,Role.HQ},'payout.write':{Role.SUPER,Role.ADMIN},
  'load.unload':{Role.WAREHOUSE,Role.HQ},'load.resolve':{Role.HQ},'load.vehicle_full':{Role.DRIVER,Role.COLLECTOR},'receipt.explain':{Role.WAREHOUSE},
 }
 def effective_permissions(user):
     role=user.role
+    if role==Role.DIGESTER:
+        allowed={'dashboard','kwd_leads','kwd_sales','kwd_stock','kwd_targets','kwd_presentations',
+                 'bills','bill.write','customers','customer.create'}
+        if getattr(user,'custom_role_id',None): return allowed.intersection(user.custom_role.permissions or [])
+        return allowed
     if role in SEGMENT_NETWORK:
         allowed={key for key,roles in GRANTS.items() if role in roles or Role.ADMIN in roles}
-        # App managers administer the scrap network; digester earnings remain
-        # exclusive to digester managers and finance roles.
+        # App managers inherit network permissions except for the Admin-only
+        # general Billing workspace; assigned pickup operations stay separate.
         if role==Role.APP_MANAGER:
-            allowed.discard('earnings')
-            allowed.discard('payout.write')
+            allowed.difference_update({'bills','quotations','payments','earnings','customers','bill.write',
+                                       'quotation.write','customer.create','customer.edit','company.billing','payout.write'})
     else:
         allowed={key for key,roles in GRANTS.items() if role in roles}
     if getattr(user,'custom_role_id',None):
@@ -62,10 +71,14 @@ def effective_permissions(user):
     return allowed
 
 def role_permissions(role):
+    if role==Role.DIGESTER:
+        return {'dashboard','kwd_leads','kwd_sales','kwd_stock','kwd_targets','kwd_presentations',
+                'bills','bill.write','customers','customer.create'}
     if role in SEGMENT_NETWORK:
         allowed={key for key,roles in GRANTS.items() if role in roles or Role.ADMIN in roles}
         if role==Role.APP_MANAGER:
-            allowed.discard('earnings');allowed.discard('payout.write')
+            allowed.difference_update({'bills','quotations','payments','earnings','customers','bill.write',
+                                       'quotation.write','customer.create','customer.edit','company.billing','payout.write'})
         return allowed
     return {key for key,roles in GRANTS.items() if role in roles}
 

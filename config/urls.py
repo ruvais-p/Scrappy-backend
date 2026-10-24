@@ -10,7 +10,16 @@ from core.views import ReconciliationQueueView
 from core.inventory_reports import InventoryReportView,InventoryAdjustmentView
 from core.presentation import SearchView,PricingView
 from core.digester_views import LSGDView,LSGDImportView,LSGDImportCommitView,LSGDAssignmentView,LSGDContactView,OpportunityView,VisitPlanView,FieldVisitView,FieldVisitReviewView,FieldVisitPhotoView,FollowUpView,FieldDayView,ExpenseItemView,ExpenseSettlementView,ExpensePolicyView,DigesterDashboardView
+from core.kwd_views import KWDLeadView,KWDTargetView,KWDPresentationView,KWDStockView,KWDSaleProgressView,KWDSalesView
 urlpatterns=[
+ path('api/v1/kwd/leads/',KWDLeadView.as_view()),
+ path('api/v1/kwd/leads/<uuid:pk>/',KWDLeadView.as_view()),
+ path('api/v1/kwd/targets/',KWDTargetView.as_view()),
+ path('api/v1/kwd/presentations/',KWDPresentationView.as_view()),
+ path('api/v1/kwd/presentations/<uuid:pk>/',KWDPresentationView.as_view()),
+ path('api/v1/kwd/stock/',KWDStockView.as_view()),
+ path('api/v1/kwd/sales/<uuid:pk>/progress/',KWDSaleProgressView.as_view()),
+ path('api/v1/kwd/sales/',KWDSalesView.as_view()),
  path('api/v1/digester/dashboard/',DigesterDashboardView.as_view()),
  path('api/v1/digester/field-days/',FieldDayView.as_view()),
  path('api/v1/digester/field-days/<uuid:pk>/',FieldDayView.as_view()),

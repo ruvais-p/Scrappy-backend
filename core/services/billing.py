@@ -92,13 +92,19 @@ def save_draft(actor,data,bill=None):
     if billing_mode=='company': require(actor,'company.billing')
     if not bill: bill=Bill(franchise=book,creator=actor,customer=customer,kind=kind,transaction_type=transaction_type,mode=mode)
     bill.kind=kind;bill.transaction_type=transaction_type;bill.mode=mode
+    if actor.role==Role.DIGESTER and kind=='sale' and data.get('kwd_lead'):
+        lead=KWDLead.objects.filter(pk=data.get('kwd_lead'),franchise=book,sale__isnull=True).first()
+        if not lead: raise ValidationError({'kwd_lead':'Choose an open lead assigned to your franchise.'})
+        bill.snapshot={**(bill.snapshot if isinstance(bill.snapshot,dict) else {}),'kwd_lead':str(lead.pk)}
     bill.lines=lines;bill.billing_mode=billing_mode;bill.customer=customer;bill.notes=str(data.get('notes',''))[:1000];bill.subtotal=sum(Decimal(l['amount']) for l in lines);bill.total=bill.subtotal;bill.version+=1;bill.save()
     event(actor,'pickups' if bill.lead_id else 'bills',bill,action='bill.draft_saved')
     return bill
 
+@transaction.atomic
 def issue(actor,bill,data):
     version(bill,data.get('version'))
     if bill.state!='draft': raise Conflict('This bill is already issued.')
+    kwd_lead_ref=bill.snapshot.get('kwd_lead') if isinstance(bill.snapshot,dict) else None
     config=policy('billing_issue')
     required=('tax_mode','rounding')
     if any(k not in config for k in required): raise PolicyUnavailable('Billing policy is incomplete.')
@@ -145,6 +151,16 @@ def issue(actor,bill,data):
     access=billing_access(actor)
     if bill.transaction_type not in access['types'] or bill.mode not in access['modes']:
         raise PermissionDenied('This transaction type or mode is not available for your role.')
+    stock_rows=[]
+    if bill.franchise.kind=='digester' and bill.kind=='sale':
+        for line in bill.lines:
+            product=Product.objects.select_related('category').get(pk=line['product'])
+            if not product.tracks_stock: continue
+            balance=KWDStockBalance.objects.select_for_update().filter(franchise=bill.franchise,product=product).first()
+            quantity=Decimal(line['quantity'])
+            if not balance or quantity>balance.quantity-balance.held_quantity:
+                raise ValidationError(f'Insufficient available stock for {product.name}.')
+            stock_rows.append((balance,product,quantity))
     today=timezone.localdate()
     start_year=today.year if today.month>=4 else today.year-1
     fy=f'{start_year%100:02d}-{(start_year+1)%100:02d}'
@@ -163,6 +179,8 @@ def issue(actor,bill,data):
                 line['tax']=str(tax);bill.tax+=tax
         bill.total=bill.subtotal+bill.tax
     bill.snapshot={'issuer':issuer,'customer':{'name':bill.customer.name,'address':bill.customer.address,'area':bill.customer.area,'state':bill.customer.state,'phone':bill.customer.phone,'gstin':bill.customer.gstin},'book':bill.franchise.name,'billing_mode':bill.billing_mode,'billing_issuer_book':issuer_book,'creator':actor.get_full_name() or actor.email,'terms':config.get('terms',''),'policy':config}
+    if actor.role==Role.DIGESTER and kwd_lead_ref:
+        bill.snapshot['kwd_lead']=str(kwd_lead_ref)
     if quotation: bill.snapshot['quotation']={'id':str(quotation.pk),'number':quotation.number}
     if bill.lead_id:
         bill.snapshot['pickup']={'lead':str(bill.lead_id),'load':str(bill.lead.load_id) if bill.lead.load_id else '', 'collector':actor.get_full_name(),'vehicle':actor.vehicle,'area':actor.area}
@@ -170,7 +188,18 @@ def issue(actor,bill,data):
     if bill.franchise.kind=='digester':
         policy('digester_earnings');bill.share_percent=bill.franchise.share_percent
         EarningsEntry.objects.create(franchise=bill.franchise,bill=bill,actor=actor,kind='earning',amount=(bill.subtotal*bill.share_percent/100).quantize(Decimal('.01'),rounding=ROUND_HALF_UP))
-    bill.save();event(actor,'pickups' if bill.lead_id else 'bills',bill,{'number':bill.number},'bill.issued')
+    bill.save()
+    for balance,product,quantity in stock_rows:
+        balance.quantity-=quantity;balance.version+=1;balance.save(update_fields=['quantity','version','updated_at'])
+        KWDStockMovement.objects.create(franchise=bill.franchise,product=product,actor=actor,kind='sale',quantity=-quantity,reason=f'Sale {bill.number}',source_bill=bill)
+    kwd_lead_id=kwd_lead_ref
+    if kwd_lead_id and bill.franchise.kind=='digester' and bill.kind=='sale':
+        lead=KWDLead.objects.select_for_update().filter(pk=kwd_lead_id,franchise=bill.franchise,sale__isnull=True).first()
+        if not lead: raise Conflict('The linked KWD lead has already been converted.')
+        old_status=lead.status
+        lead.sale=bill;lead.status='closed';lead.closed_at=timezone.now();lead.version+=1;lead.save(update_fields=['sale','status','closed_at','version','updated_at'])
+        KWDLeadEvent.objects.create(lead=lead,actor=actor,action='sale_linked',old_status=old_status,new_status='closed',note=f'Sale {bill.number}')
+    event(actor,'pickups' if bill.lead_id else 'bills',bill,{'number':bill.number},'bill.issued')
     return bill
 
 @transaction.atomic

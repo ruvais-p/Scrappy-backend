@@ -286,7 +286,8 @@ def read_visit_photo(upload):
 
 
 def save_visit_photo(raw, owner):
-    path=f'digester/visits/{owner.pk}/{uuid.uuid4().hex}{".png" if raw.startswith(b"\x89PNG") else ".webp" if raw.startswith(b"RIFF") else ".jpg"}'
+    extension = ".png" if raw.startswith(bytes([137, 80, 78, 71])) else ".webp" if raw.startswith(b"RIFF") else ".jpg"
+    path=f'digester/visits/{owner.pk}/{uuid.uuid4().hex}{extension}'
     absolute=settings.PRIVATE_ROOT/path
     absolute.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
     absolute.write_bytes(raw);absolute.chmod(0o600)
@@ -395,7 +396,7 @@ class FieldVisitView(APIView):
 @documented
 class FieldVisitReviewView(APIView):
     def post(self,request,pk,action):
-        if action not in ('review','sign-off'): raise NotFound()
+        if action not in ('review','sign-off','office-location'): raise NotFound()
         require(request.user,'visit.review')
         try: row=FieldVisit.objects.select_related('owner','lsgd').get(pk=pk)
         except FieldVisit.DoesNotExist: raise NotFound()
@@ -406,7 +407,14 @@ class FieldVisitReviewView(APIView):
         def run(actor):
             current=FieldVisit.objects.select_for_update().select_related('owner','lsgd').get(pk=row.pk)
             version(current,data.get('version'))
-            if action=='sign-off':
+            if action=='office-location':
+                if actor.role not in (Role.ZONAL_MANAGER,Role.DIGESTER_MANAGER): raise PermissionDenied()
+                if current.latitude is None or current.longitude is None: raise ValidationError('This visit has no GPS position to save as the LSGD office location.')
+                lsgd=LSGD.objects.select_for_update().get(pk=current.lsgd_id)
+                if lsgd.latitude is not None and lsgd.longitude is not None: raise ValidationError('This LSGD already has an office location.')
+                lsgd.latitude=current.latitude;lsgd.longitude=current.longitude;lsgd.version+=1;lsgd.save(update_fields=['latitude','longitude','version','updated_at'])
+                AuditEvent.objects.create(actor=actor,action='digester.lsgd.office_location_saved',resource=str(lsgd.pk),details={'visit':str(current.pk),'latitude':str(lsgd.latitude),'longitude':str(lsgd.longitude)})
+            elif action=='sign-off':
                 if actor.role!=Role.DIGESTER_MANAGER or current.zm_status!='verified' or not current.details_at or not current.people_met.exists(): raise ValidationError('Only a complete Zonal-Manager-verified visit can be signed off.')
                 current.ho_signed_at=timezone.now();current.ho_reviewer=actor;current.ho_remark=str(data.get('remark',''))[:2000]
             else:
@@ -518,7 +526,7 @@ def expense_scope(user, qs):
 def claim_payload(row):
     history=row.events.select_related('actor').order_by('created_at')
     if row.owner.role!=Role.DIGESTER_MANAGER: history=history.exclude(action__in=['flag','unflag'])
-    return {'id':str(row.pk),'version':row.version,'owner':str(row.owner_id),'owner_name':row.owner.get_full_name() or row.owner.email,'manager':str(row.owner.manager_id) if row.owner.manager_id else None,'day':row.day.isoformat(),'status':row.status,'travel_mode':row.travel_mode,'vehicle_number':row.vehicle_number,'start_odometer':row.start_odometer,'end_odometer':row.end_odometer,'start_photo':f'/api/v1/digester/field-days/{row.pk}/photo-start/','end_photo':f'/api/v1/digester/field-days/{row.pk}/photo-end/' if row.end_photo_path else None,'started_at':row.started_at.isoformat(),'ended_at':row.ended_at.isoformat() if row.ended_at else None,'night_halt':row.night_halt,'halt_place':row.halt_place,'note':row.note,'da_requested':str(row.da_requested),'ta_km':str(row.ta_km),'gps_km':str(row.gps_km) if row.gps_km is not None else None,'ta_amount':str(row.ta_amount),'total_claimed':str(row.total_claimed),'approved_amount':str(row.approved_amount) if row.approved_amount is not None else None,'flags':row.flags,'review_note':row.review_note,'ho_note':row.ho_note,'items':[{'id':str(i.pk),'category':i.category,'amount':str(i.amount),'description':i.description,'bill_number':i.bill_number,'photo':f'/api/v1/digester/expense-items/{i.pk}/photo/'} for i in row.items.all()],'history':[{'action':e.action,'actor':e.actor.get_full_name() or e.actor.email,'at':e.created_at.isoformat(),'old_status':e.old_status,'new_status':e.new_status,'amount':str(e.amount) if e.amount is not None else None,'note':e.note} for e in history]}
+    return {'id':str(row.pk),'version':row.version,'owner':str(row.owner_id),'owner_name':row.owner.get_full_name() or row.owner.email,'manager':str(row.owner.manager_id) if row.owner.manager_id else None,'day':row.day.isoformat(),'status':row.status,'travel_mode':row.travel_mode,'vehicle_number':row.vehicle_number,'start_odometer':row.start_odometer,'end_odometer':row.end_odometer,'start_photo':f'/api/v1/digester/field-days/{row.pk}/photo-start/' if row.start_photo_path else None,'end_photo':f'/api/v1/digester/field-days/{row.pk}/photo-end/' if row.end_photo_path else None,'started_at':row.started_at.isoformat(),'ended_at':row.ended_at.isoformat() if row.ended_at else None,'night_halt':row.night_halt,'halt_place':row.halt_place,'note':row.note,'da_requested':str(row.da_requested),'ta_km':str(row.ta_km),'gps_km':str(row.gps_km) if row.gps_km is not None else None,'ta_amount':str(row.ta_amount),'total_claimed':str(row.total_claimed),'approved_amount':str(row.approved_amount) if row.approved_amount is not None else None,'policy_version':row.policy_version,'policy_snapshot':row.policy_snapshot,'flags':row.flags,'review_note':row.review_note,'ho_note':row.ho_note,'items':[{'id':str(i.pk),'category':i.category,'amount':str(i.amount),'description':i.description,'route_from':i.route_from,'route_to':i.route_to,'bill_number':i.bill_number,'photo':f'/api/v1/digester/expense-items/{i.pk}/photo/'} for i in row.items.all()],'history':[{'action':e.action,'actor':e.actor.get_full_name() or e.actor.email,'at':e.created_at.isoformat(),'old_status':e.old_status,'new_status':e.new_status,'amount':str(e.amount) if e.amount is not None else None,'note':e.note} for e in history]}
 
 def recalc_claim_total(row):
     non_travel=row.items.exclude(category__in=['da_bill','bus_train','auto_taxi','parking_toll']).aggregate(total=models.Sum('amount'))['total'] or Decimal('0')
@@ -526,12 +534,20 @@ def recalc_claim_total(row):
     return row.total_claimed
 
 
-def _claim_policy():
+def _claim_policy(mode=None):
     row=ExpensePolicy.objects.first()
-    if not row or not row.two_wheeler_rate or not row.car_rate or not row.da_local_max or not row.da_night_max:
+    missing=not row or not row.da_local_max or not row.da_night_max
+    if row and mode=='two_wheeler' and not row.two_wheeler_rate: missing=True
+    if row and mode=='car' and not row.car_rate: missing=True
+    if missing:
         from rest_framework.exceptions import APIException
         raise APIException('Head Office must configure TA/DA rates and limits before claims can be started.')
     return row
+
+
+def _claim_policy_value(day, key, fallback):
+    try: return Decimal(str(day.policy_snapshot[key]))
+    except (KeyError, TypeError, InvalidOperation): return fallback
 
 
 def _claim_upload(upload, owner, prefix):
@@ -562,35 +578,41 @@ class FieldDayView(APIView):
     def post(self,request,pk=None,action=None):
         data=request.data
         if not action:
-            require(request.user,'claim.write');_claim_policy()
+            require(request.user,'claim.write')
             if request.user.role not in (Role.TSO,Role.ZONAL_MANAGER): raise PermissionDenied()
             today=timezone.localdate()
             if FieldDay.objects.filter(owner=request.user,day=today).exists(): raise ValidationError('A field day already exists for today.')
             mode=str(data.get('travel_mode',''))
             if mode not in dict(FieldDay.MODES): raise ValidationError({'travel_mode':'Choose a supported travel mode.'})
+            policy_row=_claim_policy(mode)
             vehicle=str(data.get('vehicle_number','')).strip()
-            if mode!='public_transport' and not vehicle: raise ValidationError({'vehicle_number':'Enter the vehicle number.'})
-            try: odometer=int(data.get('start_odometer')) if mode!='public_transport' else None
+            personal=mode in ('two_wheeler','car')
+            if personal and not vehicle: raise ValidationError({'vehicle_number':'Enter the vehicle number.'})
+            try: odometer=int(data.get('start_odometer')) if personal else None
             except (TypeError,ValueError): raise ValidationError({'start_odometer':'Enter a valid starting odometer.'})
+            if odometer is not None and odometer<0: raise ValidationError({'start_odometer':'Odometer must be zero or greater.'})
             try: latitude=Decimal(str(data.get('latitude')));longitude=Decimal(str(data.get('longitude')))
             except (InvalidOperation,TypeError,ValueError): raise ValidationError({'latitude':'Record a valid GPS position before starting.'})
             if latitude<Decimal('8.0') or latitude>Decimal('13.0') or longitude<Decimal('74.0') or longitude>Decimal('78.5'): raise ValidationError({'latitude':'GPS position must be within Kerala.'})
-            photo,digest=_claim_upload(request.FILES.get('start_photo'),request.user,'start')
+            if personal: photo,digest=_claim_upload(request.FILES.get('start_photo'),request.user,'start')
+            else: photo,digest='', ''
             try:
                 def run(actor):
-                    row=FieldDay.objects.create(owner=actor,day=today,travel_mode=mode,vehicle_number=vehicle,start_odometer=odometer,start_photo_path=photo,start_latitude=latitude,start_longitude=longitude,started_at=timezone.now())
+                    snapshot={key:str(getattr(policy_row,key)) for key in ('two_wheeler_rate','car_rate','da_local_max','da_night_max','da_bill_threshold','lodging_cap','auto_taxi_cap','daily_km_limit','gps_allowance_percent','road_factor','submit_days')}
+                    row=FieldDay.objects.create(owner=actor,day=today,travel_mode=mode,vehicle_number=vehicle,start_odometer=odometer,start_photo_path=photo,start_latitude=latitude,start_longitude=longitude,started_at=timezone.now(),policy_version=policy_row.version,policy_snapshot=snapshot)
                     ClaimEvent.objects.create(field_day=row,actor=actor,action='start',new_status='open',note=f'evidence:{digest}')
                     return claim_payload(row)
                 return Response(command(request.user,request.headers.get('Idempotency-Key'),'digester.fieldday.start',{**data.dict(),'photo':digest},run),status=201)
             except Exception:
-                (settings.PRIVATE_ROOT/photo).unlink(missing_ok=True);raise
+                if photo: (settings.PRIVATE_ROOT/photo).unlink(missing_ok=True)
+                raise
         require(request.user,'claim.write')
         qs=expense_scope(request.user,FieldDay.objects.select_related('owner').prefetch_related('items'))
         row=qs.filter(pk=pk).first()
         if not row: raise NotFound()
         if action=='edit':
             if row.owner_id!=request.user.pk or row.status!='open': raise PermissionDenied()
-            policy_row=_claim_policy()
+            policy_row=_claim_policy(row.travel_mode)
             try: da=Decimal(str(data.get('da_requested','0')))
             except InvalidOperation: raise ValidationError({'da_requested':'Enter a valid DA amount.'})
             maximum=policy_row.da_night_max if data.get('night_halt') in (True,'true','1','on') else policy_row.da_local_max
@@ -604,7 +626,10 @@ class FieldDayView(APIView):
             return Response(command(request.user,request.headers.get('Idempotency-Key'),'digester.fieldday.edit',{**data.dict(),'day':str(row.pk)},run))
         if action=='end':
             if row.owner_id!=request.user.pk or row.status!='open' or row.ended_at: raise PermissionDenied()
-            policy_row=_claim_policy();photo,digest=_claim_upload(request.FILES.get('end_photo'),request.user,'end')
+            policy_row=_claim_policy(row.travel_mode)
+            personal=row.travel_mode in ('two_wheeler','car')
+            if personal: photo,digest=_claim_upload(request.FILES.get('end_photo'),request.user,'end')
+            else: photo,digest='', ''
             try: end_odo=int(data.get('end_odometer')) if row.start_odometer is not None else None
             except (TypeError,ValueError): raise ValidationError({'end_odometer':'Enter a valid ending odometer.'})
             if end_odo is not None and end_odo<row.start_odometer: raise ValidationError('Ending odometer cannot be below the start reading.')
@@ -615,11 +640,12 @@ class FieldDayView(APIView):
                 current=FieldDay.objects.select_for_update().get(pk=row.pk);version(current,data.get('version'))
                 current.end_odometer=end_odo;current.end_photo_path=photo;current.end_latitude=latitude;current.end_longitude=longitude;current.ended_at=timezone.now()
                 current.ta_km=Decimal(end_odo-row.start_odometer) if end_odo is not None else Decimal('0')
-                rate=policy_row.two_wheeler_rate if current.travel_mode=='two_wheeler' else policy_row.car_rate if current.travel_mode=='car' else Decimal('0')
+                rate=_claim_policy_value(current,'two_wheeler_rate',policy_row.two_wheeler_rate) if current.travel_mode=='two_wheeler' else _claim_policy_value(current,'car_rate',policy_row.car_rate) if current.travel_mode=='car' else Decimal('0')
                 travel=sum((i.amount for i in current.items.filter(category__in=['bus_train','auto_taxi','parking_toll'])),Decimal('0'))
                 current.ta_amount=current.ta_km*rate+travel
                 current.flags=[]
-                if current.ta_km>policy_row.daily_km_limit: current.flags.append('daily_km_limit')
+                daily_limit=int(current.policy_snapshot.get('daily_km_limit',policy_row.daily_km_limit))
+                if current.ta_km>daily_limit: current.flags.append('daily_km_limit')
                 current_visits=list(FieldVisit.objects.filter(owner=actor,visited_at__date=current.day).order_by('visited_at'))
                 if not current_visits: current.flags.append('no_lsgd_visit')
                 if any(v.zm_status=='rejected' for v in current_visits): current.flags.append('rejected_visit')
@@ -627,12 +653,14 @@ class FieldDayView(APIView):
                 if any(lat is None or lon is None for lat,lon in points): current.flags.append('weak_or_missing_gps')
                 else:
                     raw_km=sum(haversine_m(points[i][0],points[i][1],points[i+1][0],points[i+1][1]) for i in range(len(points)-1))/1000
-                    current.gps_km=Decimal(str(raw_km))*policy_row.road_factor
-                    if current.gps_km and current.ta_km>current.gps_km*(1+Decimal(policy_row.gps_allowance_percent)/100): current.flags.append('odometer_above_gps')
+                    road_factor=_claim_policy_value(current,'road_factor',policy_row.road_factor)
+                    allowance=_claim_policy_value(current,'gps_allowance_percent',Decimal(policy_row.gps_allowance_percent))
+                    current.gps_km=Decimal(str(raw_km))*road_factor
+                    if current.gps_km and current.ta_km>current.gps_km*(1+allowance/100): current.flags.append('odometer_above_gps')
                 item_totals={item['category']:Decimal(str(item['total'])) for item in current.items.values('category').annotate(total=models.Sum('amount'))}
-                if item_totals.get('lodging',Decimal(0))>policy_row.lodging_cap: current.flags.append('lodging_over_cap')
-                if item_totals.get('auto_taxi',Decimal(0))>policy_row.auto_taxi_cap: current.flags.append('auto_taxi_over_cap')
-                if current.da_requested>policy_row.da_bill_threshold and not current.items.filter(category='da_bill').exists(): current.flags.append('missing_da_bill')
+                if item_totals.get('lodging',Decimal(0))>_claim_policy_value(current,'lodging_cap',policy_row.lodging_cap): current.flags.append('lodging_over_cap')
+                if item_totals.get('auto_taxi',Decimal(0))>_claim_policy_value(current,'auto_taxi_cap',policy_row.auto_taxi_cap): current.flags.append('auto_taxi_over_cap')
+                if current.da_requested>_claim_policy_value(current,'da_bill_threshold',policy_row.da_bill_threshold) and not current.items.filter(category='da_bill').exists(): current.flags.append('missing_da_bill')
                 if current.day.weekday()==6: current.flags.append('sunday')
                 if timezone.localtime(current.started_at).hour>9: current.flags.append('late_start')
                 previous=FieldDay.objects.filter(owner=actor,day__lt=current.day,end_odometer__isnull=False).order_by('-day').first()
@@ -641,7 +669,9 @@ class FieldDayView(APIView):
                 ClaimEvent.objects.create(field_day=current,actor=actor,action='end',new_status=current.status,amount=current.total_claimed,note=f'evidence:{digest}')
                 return claim_payload(current)
             try: return Response(command(request.user,request.headers.get('Idempotency-Key'),'digester.fieldday.end',{**data.dict(),'day':str(row.pk),'photo':digest},run))
-            except Exception: (settings.PRIVATE_ROOT/photo).unlink(missing_ok=True);raise
+            except Exception:
+                if photo: (settings.PRIVATE_ROOT/photo).unlink(missing_ok=True)
+                raise
         if action in ('submit','review','approve','send-back','reject','flag','unflag'):
             return self.transition(request,row,action)
         raise NotFound()
@@ -658,7 +688,7 @@ class FieldDayView(APIView):
             if row.owner_id!=actor.pk or row.status!='open' or not row.ended_at: raise ValidationError('End the field day before submitting.')
             policy_row=_claim_policy()
             if policy_row.submit_days and timezone.localdate()-row.day>timedelta(days=policy_row.submit_days): raise ValidationError('The submission window for this field day has passed.')
-            if row.da_requested>policy_row.da_bill_threshold and not row.items.filter(category='da_bill').exists(): raise ValidationError('Add a DA bill photo before submitting this amount.')
+            if row.da_requested>_claim_policy_value(row,'da_bill_threshold',policy_row.da_bill_threshold) and not row.items.filter(category='da_bill').exists(): raise ValidationError('Add a DA bill photo before submitting this amount.')
             target='submitted'
         elif actor.role==Role.ZONAL_MANAGER and action in ('review','send-back','reject'):
             if actor.role!=Role.ZONAL_MANAGER or row.owner.manager_id!=actor.pk or row.status!='submitted': raise PermissionDenied()
@@ -690,7 +720,8 @@ class FieldDayView(APIView):
             ClaimEvent.objects.create(field_day=current,actor=user,action=action,old_status=old,new_status=target,amount=approved if approved is not None else current.total_claimed,note=note)
             AuditEvent.objects.create(actor=user,action='digester.claim.'+action,resource=str(current.pk),details={'owner':current.owner_id,'amount':str(approved or current.total_claimed),'note':note})
             return claim_payload(current)
-        return Response(command(actor,request.headers.get('Idempotency-Key'),'digester.claim.'+action,{**data.dict(),'day':str(row.pk)},run))
+        payload=data.dict() if hasattr(data,'dict') else dict(data)
+        return Response(command(actor,request.headers.get('Idempotency-Key'),'digester.claim.'+action,{**payload,'day':str(row.pk)},run))
 
     def photo(self,request,pk):
         field_day=FieldDay.objects.filter(pk=pk,owner__in=User.objects.filter(pk__in=expense_scope(request.user,User.objects.all()).values('pk'))).prefetch_related('items').first()
@@ -713,7 +744,7 @@ class ExpenseItemView(APIView):
             return FileResponse(path.open('rb'),content_type=mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
         qs=ExpenseItem.objects.filter(field_day__in=expense_scope(request.user,FieldDay.objects.all()))
         if request.query_params.get('field_day'): qs=qs.filter(field_day_id=request.query_params['field_day'])
-        return Response({'count':qs.count(),'results':[{'id':str(item.pk),'field_day':str(item.field_day_id),'day':item.field_day.day.isoformat(),'owner':str(item.field_day.owner_id),'category':item.category,'amount':str(item.amount),'description':item.description,'bill_number':item.bill_number,'photo':f'/api/v1/digester/expense-items/{item.pk}/photo/'} for item in qs.select_related('field_day','field_day__owner').order_by('-created_at')[:500]]})
+        return Response({'count':qs.count(),'results':[{'id':str(item.pk),'field_day':str(item.field_day_id),'day':item.field_day.day.isoformat(),'owner':str(item.field_day.owner_id),'category':item.category,'amount':str(item.amount),'description':item.description,'route_from':item.route_from,'route_to':item.route_to,'bill_number':item.bill_number,'photo':f'/api/v1/digester/expense-items/{item.pk}/photo/'} for item in qs.select_related('field_day','field_day__owner').order_by('-created_at')[:500]]})
     def post(self,request,pk=None,action=None):
         require(request.user,'claim.write')
         day=expense_scope(request.user,FieldDay.objects.all()).filter(pk=request.data.get('field_day'),owner=request.user,status='open').first()
@@ -724,16 +755,20 @@ class ExpenseItemView(APIView):
         except InvalidOperation: raise ValidationError({'amount':'Enter a valid amount.'})
         if amount<0 or (category!='da_bill' and amount<=0): raise ValidationError({'amount':'Enter a positive bill amount.'})
         if category=='da_bill': amount=Decimal('0')
+        route_from=str(request.data.get('route_from','')).strip()[:180]
+        route_to=str(request.data.get('route_to','')).strip()[:180]
+        if category in ('bus_train','auto_taxi') and (not route_from or not route_to):
+            raise ValidationError({'route_from':'Enter the travel route from and to.'})
         upload=request.FILES.get('photo');path,digest=_claim_upload(upload,request.user,'bill')
         policy_row=_claim_policy() if day.ended_at else None
         try:
-            row=ExpenseItem.objects.create(field_day=day,category=category,amount=amount,description=str(request.data.get('description',''))[:500],bill_number=str(request.data.get('bill_number',''))[:100],photo_path=path,photo_digest=digest,created_by=request.user)
+            row=ExpenseItem.objects.create(field_day=day,category=category,amount=amount,description=str(request.data.get('description',''))[:500],route_from=route_from,route_to=route_to,bill_number=str(request.data.get('bill_number',''))[:100],photo_path=path,photo_digest=digest,created_by=request.user)
             duplicate_photo=ExpenseItem.objects.filter(photo_digest=digest).exclude(pk=row.pk).exists()
             duplicate_bill=bool(row.bill_number and ExpenseItem.objects.filter(category=category,amount=amount,bill_number=row.bill_number).exclude(pk=row.pk).exists())
             if duplicate_photo or duplicate_bill:
                 day.flags=list(day.flags)+(['duplicate_bill_photo'] if duplicate_photo else [])+(['duplicate_bill_number'] if duplicate_bill else [])
             if day.ended_at:
-                rate=policy_row.two_wheeler_rate if day.travel_mode=='two_wheeler' else policy_row.car_rate if day.travel_mode=='car' else Decimal('0')
+                rate=_claim_policy_value(day,'two_wheeler_rate',policy_row.two_wheeler_rate) if day.travel_mode=='two_wheeler' else _claim_policy_value(day,'car_rate',policy_row.car_rate) if day.travel_mode=='car' else Decimal('0')
                 travel=day.items.filter(category__in=['bus_train','auto_taxi','parking_toll']).aggregate(total=models.Sum('amount'))['total'] or Decimal('0')
                 day.ta_amount=day.ta_km*rate+travel
             ClaimEvent.objects.create(field_day=day,actor=request.user,action='bill_added',new_status=day.status,amount=amount,note=category)

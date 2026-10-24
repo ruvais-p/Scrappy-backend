@@ -15,7 +15,7 @@ class Role(models.TextChoices):
     HQ = 'hq_manager', 'HQ Manager'
     APP = 'app_franchise_manager', 'App Franchise Manager'
     DRIVER = 'delivery_staff', 'Delivery Staff'
-    DIGESTER = 'digester_franchise_admin', 'Legacy Digester Franchise Admin'
+    DIGESTER = 'digester_franchise_admin', 'Digester Franchise Admin'
     STAFF = 'digester_staff', 'Legacy Digester Staff'
     WAREHOUSE = 'warehouse_manager', 'Warehouse Manager'
     COLLECTOR = 'collector', 'Collector'
@@ -182,12 +182,14 @@ class FieldFollowUp(Record):
     completion_note = models.TextField(blank=True)
 
 class FieldDay(Record):
-    MODES = [('two_wheeler','Two wheeler'),('car','Car'),('public_transport','Public transport')]
+    MODES = [('two_wheeler','Two wheeler'),('car','Car'),('public_transport','Public transport'),('no_travel','No travel')]
     STATUSES = [('open','Open'),('submitted','Submitted'),('zm_approved','Verified by ZM'),('ho_approved','Approved by HQ'),('rejected','Rejected'),('paid','Paid')]
     owner = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT,related_name='expense_days')
     day = models.DateField()
     status = models.CharField(max_length=16,choices=STATUSES,default='open')
     travel_mode = models.CharField(max_length=20,choices=MODES)
+    policy_version = models.PositiveIntegerField(default=0)
+    policy_snapshot = models.JSONField(default=dict,blank=True)
     vehicle_number = models.CharField(max_length=40,blank=True)
     start_odometer = models.PositiveIntegerField(null=True,blank=True)
     end_odometer = models.PositiveIntegerField(null=True,blank=True)
@@ -224,6 +226,8 @@ class ExpenseItem(Record):
     category = models.CharField(max_length=24,choices=CATEGORIES)
     amount = models.DecimalField(max_digits=12,decimal_places=2,default=0)
     description = models.CharField(max_length=500,blank=True)
+    route_from = models.CharField(max_length=180,blank=True)
+    route_to = models.CharField(max_length=180,blank=True)
     bill_number = models.CharField(max_length=100,blank=True)
     photo_path = models.CharField(max_length=500)
     photo_digest = models.CharField(max_length=64)
@@ -346,6 +350,78 @@ class Lead(Record):
     agreed_at = models.DateTimeField(null=True,blank=True)
     closed_at = models.DateTimeField(null=True,blank=True)
 
+class KWDLead(Record):
+    STATUSES = [('new','New'),('contacted','Contacted'),('negotiating','Negotiating'),('closed','Closed'),('lost','Lost')]
+    franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT,related_name='kwd_leads')
+    name = models.CharField(max_length=180)
+    phone = models.CharField(max_length=24,blank=True)
+    place = models.CharField(max_length=180,blank=True)
+    district = models.CharField(max_length=80,blank=True)
+    head_office_note = models.TextField(blank=True)
+    status = models.CharField(max_length=16,choices=STATUSES,default='new')
+    discussion = models.TextField(blank=True)
+    follow_up_date = models.DateField(null=True,blank=True)
+    assigned_by = models.ForeignKey(User,on_delete=models.PROTECT,related_name='assigned_kwd_leads')
+    assigned_at = models.DateTimeField()
+    closed_at = models.DateTimeField(null=True,blank=True)
+    sale = models.ForeignKey('Bill',null=True,blank=True,on_delete=models.PROTECT,related_name='kwd_source_leads')
+
+class KWDLeadEvent(Record):
+    lead = models.ForeignKey(KWDLead,on_delete=models.PROTECT,related_name='events')
+    actor = models.ForeignKey(User,on_delete=models.PROTECT)
+    action = models.CharField(max_length=32)
+    old_status = models.CharField(max_length=16,blank=True)
+    new_status = models.CharField(max_length=16,blank=True)
+    note = models.TextField(blank=True)
+    follow_up_date = models.DateField(null=True,blank=True)
+
+class FranchiseTarget(Record):
+    franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT,related_name='monthly_targets')
+    month = models.DateField()
+    target_value = models.DecimalField(max_digits=14,decimal_places=2,default=0)
+    target_units = models.PositiveIntegerField(default=0)
+    set_by = models.ForeignKey(User,on_delete=models.PROTECT)
+    note = models.CharField(max_length=500,blank=True)
+    class Meta(Record.Meta):
+        constraints = [models.UniqueConstraint(fields=['franchise','month'],name='franchise_target_month_unique')]
+
+class KWDStockBalance(Record):
+    franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT,related_name='kwd_stock')
+    product = models.ForeignKey('Product',on_delete=models.PROTECT,related_name='kwd_stock_balances')
+    quantity = models.DecimalField(max_digits=14,decimal_places=3,default=0)
+    held_quantity = models.DecimalField(max_digits=14,decimal_places=3,default=0)
+    low_stock_threshold = models.DecimalField(max_digits=14,decimal_places=3,default=0)
+    class Meta(Record.Meta):
+        constraints = [models.UniqueConstraint(fields=['franchise','product'],name='kwd_stock_franchise_product_unique'),models.CheckConstraint(condition=Q(quantity__gte=0,held_quantity__gte=0,held_quantity__lte=models.F('quantity'),low_stock_threshold__gte=0),name='kwd_stock_bounds')]
+
+class KWDStockMovement(Record):
+    KINDS = [('receipt','Received'),('adjustment','Adjustment'),('hold','Held'),('release','Released'),('sale','Sale')]
+    franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT,related_name='kwd_stock_movements')
+    product = models.ForeignKey('Product',on_delete=models.PROTECT)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL,on_delete=models.PROTECT)
+    kind = models.CharField(max_length=16,choices=KINDS)
+    quantity = models.DecimalField(max_digits=14,decimal_places=3)
+    reason = models.CharField(max_length=500,blank=True)
+    source_bill = models.ForeignKey('Bill',null=True,blank=True,on_delete=models.PROTECT,related_name='kwd_stock_movements')
+
+class PresentationAppointment(Record):
+    VENUES = [('private','Private home/site'),('office','Office'),('public','Public venue')]
+    STATES = [('upcoming','Upcoming'),('completed','Completed'),('cancelled','Cancelled')]
+    franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT,related_name='kwd_presentations')
+    lead = models.ForeignKey(KWDLead,null=True,blank=True,on_delete=models.PROTECT,related_name='presentations')
+    scheduled_at = models.DateTimeField()
+    venue = models.CharField(max_length=16,choices=VENUES)
+    person_name = models.CharField(max_length=180,blank=True)
+    district = models.CharField(max_length=80,blank=True)
+    address = models.CharField(max_length=500,blank=True)
+    contact_person = models.CharField(max_length=180,blank=True)
+    contact_phone = models.CharField(max_length=24,blank=True)
+    people_expected = models.CharField(max_length=300,blank=True)
+    products = models.ManyToManyField('Product',related_name='kwd_presentations',blank=True)
+    status = models.CharField(max_length=16,choices=STATES,default='upcoming')
+    outcome = models.TextField(blank=True)
+    created_by = models.ForeignKey(User,on_delete=models.PROTECT,related_name='created_kwd_presentations')
+
 class Bill(Record):
     franchise = models.ForeignKey(Franchise,on_delete=models.PROTECT)
     creator = models.ForeignKey(User,on_delete=models.PROTECT)
@@ -356,6 +432,8 @@ class Bill(Record):
     mode = models.CharField(max_length=8,choices=[('purchase','Purchase'),('sales','Sales')],default='purchase')
     billing_mode = models.CharField(max_length=16,choices=[('franchise','Franchise Billing'),('company','Company Billing')],default='franchise')
     state = models.CharField(max_length=24,default='draft')
+    delivery_status = models.CharField(max_length=16,choices=[('pending','To deliver'),('delivered','Delivered'),('cancelled','Cancelled')],default='pending')
+    installation_status = models.CharField(max_length=16,choices=[('pending','To install'),('installed','Installed'),('not_required','Not required')],default='pending')
     number = models.CharField(max_length=80,unique=True,null=True,blank=True)
     lines = models.JSONField(default=list)
     snapshot = models.JSONField(default=dict)

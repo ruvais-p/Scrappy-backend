@@ -22,6 +22,9 @@ def synthetic_records(password=None,policies=False):
                 u.email=email;u.username=email
         else:
             u,created=User.objects.get_or_create(username=email,defaults={'email':email,'role':role,'franchise':b,'manager':manager,'warehouse':warehouses[0] if role==Role.WAREHOUSE else None,'first_name':Role(role).label})
+            if role==Role.DIGESTER and not created and u.franchise_id!=b.id:
+                u.franchise=b
+                u.save(update_fields=['franchise'])
         if password:
             # Demo accounts are synthetic and must stay aligned with the
             # documented SCRAPPY_DEMO_PASSWORD when the seeder is rerun.

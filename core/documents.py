@@ -477,7 +477,7 @@ def pdf_response(data, version, filename=None):
 class BillPDF(APIView):
     @extend_schema(responses=bytes)
     def get(self,request,pk):
-        feature='pickups' if request.user.role in ('hq_manager','collector') else 'bills'
+        feature='pickups' if request.user.role in ('hq_manager','collector','delivery_staff') else 'bills'
         bill=get_object(request.user,feature,pk)
         if bill.state=='draft': raise ValidationError('A draft is not an issued invoice.')
         data,version=render_current_bill(bill.pk)
@@ -486,7 +486,7 @@ class BillPDF(APIView):
 class PDFJobView(APIView):
     @extend_schema(request=dict,responses=dict)
     def post(self,request,pk):
-        feature='pickups' if request.user.role in ('hq_manager','collector') else 'bills'
+        feature='pickups' if request.user.role in ('hq_manager','collector','delivery_staff') else 'bills'
         bill=get_object(request.user,feature,pk)
         if bill.state=='draft': raise ValidationError('A draft is not an issued invoice.')
         payload={'feature':feature,'bill':str(pk),'permission_version':request.user.permission_version}

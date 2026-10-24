@@ -113,6 +113,12 @@ authority.
 
 ## Lead assignment and scheduling
 
+The general Billing workspace (transactions, invoices, quotations, payments,
+customers, and earnings) is restricted to Admin and Super Admin. Drivers and
+Collectors retain access to assigned pickup billing and pickup PDFs; franchise
+managers retain their scoped pickup operations. This is an intentional access
+adaptation for this deployment.
+
 HQ Manager can assign or reassign eligible active Delivery Staff and
 Collectors across the network. App Franchise Manager acts as the scrap
 franchise supervisor and can assign only active drivers in the same franchise.

@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime
 from decimal import Decimal
 from django.contrib.auth.password_validation import validate_password
@@ -454,7 +455,7 @@ class TeamView(APIView):
         if user.role==Role.ZONAL_MANAGER: return [Role.TSO]
         if user.role==Role.HQ: return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE]
         if user.role==Role.APP_MANAGER: return [Role.APP,Role.DRIVER,Role.COLLECTOR,Role.WAREHOUSE]
-        return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE,Role.APP_MANAGER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO]
+        return [Role.DRIVER,Role.COLLECTOR,Role.APP,Role.WAREHOUSE,Role.APP_MANAGER,Role.DIGESTER,Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER,Role.TSO]
     @extend_schema(responses=dict)
     def get(self,request):
         require(request.user,'team');qs=User.objects.filter(role__in=self.targets(request.user))
@@ -528,8 +529,14 @@ class TeamView(APIView):
                 if book.status!='active': raise ValidationError('Choose an active franchise.')
                 if target and target.franchise_id!=book.id and Lead.objects.filter(driver=target).exclude(state__in=['closed','not_completed','cancelled']).exists(): raise Conflict('Resolve active assignments before moving this account.')
             email=str(data.get('email',target.email if target else '')).strip().lower()
+            initial_password=str(data.get('initial_password',''))
+            if target and initial_password: raise ValidationError({'initial_password':'Initial password can only be set when creating an account.'})
             if not target: target=User(username=email,email=email);target.set_unusable_password()
-            target.email=email;target.username=email;target.first_name=str(data.get('name',target.first_name))[:150];target.role=role;target.custom_role=custom_role;target.franchise=book
+            target.email=email;target.username=email;target.first_name=str(data.get('name',target.first_name))[:150]
+            if initial_password:
+                validate_password(initial_password,target)
+                target.set_password(initial_password)
+            target.role=role;target.custom_role=custom_role;target.franchise=book
             if role==Role.TSO:
                 manager_id=data.get('manager')
                 if actor.role==Role.ZONAL_MANAGER: manager_id=actor.pk
@@ -553,9 +560,12 @@ class TeamView(APIView):
             AuditEvent.objects.create(actor=actor,franchise=book,action='team.updated',resource=str(target.pk),details={'role':role,'active':target.is_active})
             Outbox.objects.create(actor=actor,feature='scope_reset',owner_id=target.id,resource_id='')
             # Invitation delivery is queued after transaction, with durable job record.
-            if not target.has_usable_password() or data.get('action')=='reset': Job.objects.create(actor=actor,kind='account_invitation',payload={'user':target.id,'purpose':'reset' if target.has_usable_password() else 'invite'})
+            if (not target.has_usable_password() or data.get('action')=='reset') and not initial_password: Job.objects.create(actor=actor,kind='account_invitation',payload={'user':target.id,'purpose':'reset' if target.has_usable_password() else 'invite'})
             return identity(target)
-        return Response(command(request.user,request.headers.get('Idempotency-Key'),'team.write',data,run))
+        safe_data={**data}
+        if safe_data.get('initial_password'):
+            safe_data['initial_password']=hashlib.sha256(str(safe_data['initial_password']).encode()).hexdigest()
+        return Response(command(request.user,request.headers.get('Idempotency-Key'),'team.write',safe_data,run))
 
 class RoleDefinitionsView(APIView):
     def get(self,request):

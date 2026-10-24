@@ -7,7 +7,7 @@ FIELDS={
 'products':(Product,['id','name','category','unit','active','tracks_stock','hsn','tax_percent','franchises','version']),
 'rates':(Rate,['id','product','franchise','kind','amount','discount_percent','actor','reason','created_at','version']),
 'leads':(Lead,['id','franchise','customer','franchise_manager','driver','load','pickup_date','pickup_time','items','latitude','longitude','state','failure_reason','started_at','sent_at','agreed_at','closed_at','version']),
-'bills':(Bill,['id','franchise','creator','customer','lead','kind','transaction_type','mode','billing_mode','state','number','lines','snapshot','subtotal','tax','total','settled','share_percent','notes','issued_at','created_at','version']),
+'bills':(Bill,['id','franchise','creator','customer','lead','kind','transaction_type','mode','billing_mode','state','delivery_status','installation_status','number','lines','snapshot','subtotal','tax','total','settled','share_percent','notes','issued_at','created_at','version']),
 'quotations':(Quotation,['id','franchise','creator','customer','kind','billing_mode','number','state','lines','subtotal','tax','total','notes','sent_at','accepted_at','rejected_at','converted_at','converted_bill','created_at','version']),
 'pickups':(Bill,['id','franchise','creator','customer','lead','kind','state','number','lines','subtotal','tax','total','settled','notes','issued_at','version']),
 'payments':(Payment,['id','bill','actor','amount','method','reference','paid_at','created_at']),
