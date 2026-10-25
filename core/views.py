@@ -415,7 +415,8 @@ class OptionsView(APIView):
         categories=Category.objects.filter(active=True)
         if user.role in SEGMENT_NETWORK: categories=categories.filter(kind=SEGMENT_NETWORK[user.role])
         elif not has_permission(user,'products'): categories=categories.filter(pk__in=products.values('category_id'))
-        return Response(cached_read(user,'options',{'presentation':8},lambda:{'franchises':[{'id':str(b.pk),'name':b.name,'kind':b.kind} for b in books],'products':[{'id':str(p.pk),'name':p.name,'unit':p.unit,'category':str(p.category_id),'billing_mode':p.category.default_billing_mode,'franchises':[str(b.pk) for b in p.franchises.all() if b.pk in book_ids]} for p in products],'categories':[{'id':str(c.pk),'name':c.name,'kind':c.kind,'default_billing_mode':c.default_billing_mode} for c in categories],'staff':[{'id':str(d.pk),'name':d.get_full_name() or d.email} for d in staff],'drivers':[{'id':str(d.pk),'name':d.get_full_name() or d.email,'franchise':str(d.franchise_id)} for d in User.objects.filter(franchise__in=driver_books,role__in=[Role.DRIVER,Role.COLLECTOR],is_active=True)] if has_permission(user,'lead.assign') or has_permission(user,'team') else [],'franchise_managers':[{'id':str(manager.pk),'name':manager.get_full_name() or manager.email,'franchise':str(manager.franchise_id),'franchise_name':manager.franchise.name} for manager in franchise_managers] if has_permission(user,'lead.assign') else [],'warehouses':[{'id':str(w.pk),'name':w.name,'franchise':str(w.franchise_id)} for w in Warehouse.objects.filter(franchise__in=books)] if has_permission(user,'team') else [],'billing_access':billing.billing_access(user)},minimum_version=minimum_version))
+        zonal_managers=User.objects.filter(role=Role.ZONAL_MANAGER,is_active=True).order_by('first_name','last_name','pk') if user.role in (Role.SUPER,Role.ADMIN) else User.objects.none()
+        return Response(cached_read(user,'options',{'presentation':9},lambda:{'franchises':[{'id':str(b.pk),'name':b.name,'kind':b.kind} for b in books],'products':[{'id':str(p.pk),'name':p.name,'unit':p.unit,'category':str(p.category_id),'billing_mode':p.category.default_billing_mode,'franchises':[str(b.pk) for b in p.franchises.all() if b.pk in book_ids]} for p in products],'categories':[{'id':str(c.pk),'name':c.name,'kind':c.kind,'default_billing_mode':c.default_billing_mode} for c in categories],'staff':[{'id':str(d.pk),'name':d.get_full_name() or d.email} for d in staff],'drivers':[{'id':str(d.pk),'name':d.get_full_name() or d.email,'franchise':str(d.franchise_id)} for d in User.objects.filter(franchise__in=driver_books,role__in=[Role.DRIVER,Role.COLLECTOR],is_active=True)] if has_permission(user,'lead.assign') or has_permission(user,'team') else [],'franchise_managers':[{'id':str(manager.pk),'name':manager.get_full_name() or manager.email,'franchise':str(manager.franchise_id),'franchise_name':manager.franchise.name} for manager in franchise_managers] if has_permission(user,'lead.assign') else [],'warehouses':[{'id':str(w.pk),'name':w.name,'franchise':str(w.franchise_id)} for w in Warehouse.objects.filter(franchise__in=books)] if has_permission(user,'team') else [],'zonal_managers':[{'id':str(row.pk),'name':row.get_full_name() or row.email} for row in zonal_managers],'billing_access':billing.billing_access(user)},minimum_version=minimum_version))
 
 class SettingsView(APIView):
     @extend_schema(request=dict,responses=dict)
@@ -493,9 +494,10 @@ class TeamView(APIView):
                 if actor.role in (Role.DIGESTER_MANAGER,Role.ZONAL_MANAGER): target_qs=digester_team_scope(actor,target_qs)
                 target=target_qs.first()
                 if not target: raise NotFound()
-            if target.role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER):
-                if actor.role not in (Role.SUPER,Role.ADMIN): raise NotFound()
-            elif target.role not in (Role.ZONAL_MANAGER,Role.TSO): book_allowed(actor,target.franchise)
+            if target:
+                if target.role in (Role.APP_MANAGER,Role.DIGESTER_MANAGER):
+                    if actor.role not in (Role.SUPER,Role.ADMIN): raise NotFound()
+                elif target.role not in (Role.ZONAL_MANAGER,Role.TSO): book_allowed(actor,target.franchise)
             if data.get('action')=='set_password':
                 if not target: raise ValidationError('Choose a user account.')
                 password=str(data.get('password',''))
